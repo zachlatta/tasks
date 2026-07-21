@@ -1,0 +1,8 @@
+.env
+data/
+dist/
+*.db
+*.db-shm
+*.db-wal
+/task-tracker
+.DS_Store

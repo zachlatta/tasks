@@ -1,0 +1,12 @@
+{{define "index.html"}}<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Task Tracker</title><link rel="stylesheet" href="/static/app.css"></head>
+<body><header><div><p class="eyebrow">MARKDOWN-BACKED</p><h1>Task Tracker</h1></div><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="quiet" type="submit">Sign out</button></form></header><main>
+{{with .Message}}<p class="notice">{{.}}</p>{{end}}
+<section class="new-task"><h2>Add a task</h2><form method="post" action="/tasks"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Title<input name="title" required></label><label>Description<textarea name="description" rows="3"></textarea></label><label>Dependencies <span>(comma-separated IDs)</span><input name="dependencies"></label><button type="submit">Create task</button></form></section>
+<section><div class="section-heading"><h2>Tasks</h2><span>{{len .Tasks}} total</span></div><div class="task-list">
+{{range .Tasks}}<article class="task {{.Status}}"><div class="task-heading"><div><span class="status">{{.Status}}</span><h3>{{.Title}}</h3><code>{{.ID}}</code></div>{{if eq .Status "todo"}}<form method="post" action="/tasks/{{.ID}}/done"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Mark done</button></form>{{end}}</div>{{with .Description}}<p class="description">{{.}}</p>{{end}}{{with .Dependencies}}<p><strong>Depends on:</strong> {{range $index, $item := .}}{{if $index}}, {{end}}<code>{{$item}}</code>{{end}}</p>{{end}}
+{{with .Attachments}}<div class="images">{{range .}}<figure><img src="/images/{{.Key}}" alt="{{.Name}}"><figcaption>{{.Name}}</figcaption></figure>{{end}}</div>{{end}}
+{{if eq .Status "todo"}}<form class="upload" method="post" enctype="multipart/form-data" action="/tasks/{{.ID}}/images"><input type="hidden" name="csrf" value="{{$.CSRF}}"><label>Attach image<input type="file" name="image" accept="image/*" required></label><button class="quiet" type="submit">Upload</button></form>{{end}}</article>
+{{else}}<p class="empty">No tasks yet. Add the first one above.</p>{{end}}</div></section></main></body>
+</html>{{end}}

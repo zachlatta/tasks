@@ -1,0 +1,47 @@
+name: Edge release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edge-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build snapshot archives
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Replace rolling edge release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete edge --cleanup-tag --yes || true
+          git tag --force edge "$GITHUB_SHA"
+          git push --force origin refs/tags/edge
+          gh release create edge dist/*.tar.gz dist/*.zip dist/checksums.txt \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Edge ${GITHUB_SHA::7}" \
+            --notes "Automated build of commit $GITHUB_SHA. This rolling prerelease is replaced by every commit to main."
