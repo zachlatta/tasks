@@ -16,6 +16,7 @@ import (
 
 	"github.com/zachlatta/task-tracker/internal/auth"
 	"github.com/zachlatta/task-tracker/internal/objectstore"
+	"github.com/zachlatta/task-tracker/internal/query"
 	"github.com/zachlatta/task-tracker/internal/task"
 )
 
@@ -30,6 +31,7 @@ var assets embed.FS
 
 type Config struct {
 	Tasks         *task.Service
+	ReadModel     *query.ReadModel
 	Objects       objectstore.Store
 	Auth          *auth.Server
 	SecureCookies bool
@@ -38,6 +40,7 @@ type Config struct {
 
 type handler struct {
 	tasks         *task.Service
+	readModel     *query.ReadModel
 	objects       objectstore.Store
 	auth          *auth.Server
 	secureCookies bool
@@ -69,6 +72,7 @@ func New(config Config) http.Handler {
 	}
 	h := &handler{
 		tasks:         config.Tasks,
+		readModel:     config.ReadModel,
 		objects:       config.Objects,
 		auth:          config.Auth,
 		secureCookies: config.SecureCookies,
@@ -139,9 +143,18 @@ func (h *handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) index(w http.ResponseWriter, r *http.Request) {
-	items, err := h.tasks.List(r.Context())
+	source, err := h.tasks.List(r.Context())
 	if err != nil {
 		http.Error(w, "load tasks", http.StatusInternalServerError)
+		return
+	}
+	if err := h.readModel.Sync(r.Context(), source); err != nil {
+		http.Error(w, "refresh task query database", http.StatusInternalServerError)
+		return
+	}
+	items, err := h.readModel.Tasks(r.Context())
+	if err != nil {
+		http.Error(w, "query tasks", http.StatusInternalServerError)
 		return
 	}
 	current := r.Context().Value(sessionContextKey{}).(session)

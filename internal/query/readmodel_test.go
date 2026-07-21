@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -36,10 +37,10 @@ func TestReadModelSyncAndQuery(t *testing.T) {
 	}
 
 	result, err := model.Query(context.Background(), `
-		SELECT t.id, t.status, d.dependency_id, a.name AS attachment
+		SELECT t.id, t.status, d.depends_on_id, i.name AS image
 		FROM tasks t
-		LEFT JOIN task_dependencies d ON d.task_id = t.id
-		LEFT JOIN task_attachments a ON a.task_id = t.id
+		LEFT JOIN dependencies d ON d.task_id = t.id
+		LEFT JOIN images i ON i.task_id = t.id
 		WHERE t.id = 'ship-feature'
 	`)
 	if err != nil {
@@ -49,8 +50,41 @@ func TestReadModelSyncAndQuery(t *testing.T) {
 		t.Fatalf("rows = %d, want 1", len(result.Rows))
 	}
 	row := result.Rows[0]
-	if row["dependency_id"] != "write-tests" || row["attachment"] != "diagram.png" {
+	if row["depends_on_id"] != "write-tests" || row["image"] != "diagram.png" {
 		t.Fatalf("row = %#v", row)
+	}
+	overview, err := model.Query(context.Background(), "SELECT blocked, dependency_count, image_count FROM task_overview WHERE id = 'ship-feature'")
+	if err != nil {
+		t.Fatalf("query task_overview: %v", err)
+	}
+	if got := overview.Rows[0]; got["blocked"] != int64(0) || got["dependency_count"] != int64(1) || got["image_count"] != int64(1) {
+		t.Fatalf("task_overview row = %#v", got)
+	}
+}
+
+func TestReadModelHasIntuitiveSchema(t *testing.T) {
+	t.Parallel()
+
+	model, err := Open(filepath.Join(t.TempDir(), "tasks.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { model.Close() })
+	result, err := model.Query(context.Background(), `
+		SELECT name FROM sqlite_schema
+		WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+		ORDER BY name
+	`)
+	if err != nil {
+		t.Fatalf("Query schema: %v", err)
+	}
+	want := []string{"dependencies", "images", "task_overview", "tasks"}
+	got := make([]string, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		got = append(got, row["name"].(string))
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("schema objects = %v, want %v", got, want)
 	}
 }
 
@@ -99,5 +133,29 @@ func TestReadModelLimitsRows(t *testing.T) {
 	}
 	if len(result.Rows) != 2 || !result.Truncated {
 		t.Fatalf("result = %#v, want two rows and truncated", result)
+	}
+}
+
+func TestTasksIsNotLimitedByPublicQueryCap(t *testing.T) {
+	t.Parallel()
+
+	model, err := Open(filepath.Join(t.TempDir(), "tasks.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { model.Close() })
+	model.SetMaxRows(1)
+	if err := model.Sync(context.Background(), []task.Task{
+		{ID: "one", Title: "One", Status: task.StatusTodo},
+		{ID: "two", Title: "Two", Status: task.StatusTodo},
+	}); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	items, err := model.Tasks(context.Background())
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("Tasks returned %d items, want all 2", len(items))
 	}
 }

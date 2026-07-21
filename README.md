@@ -16,7 +16,7 @@ Requires Go 1.26.5 or newer.
 cp .env.example .env
 # Set TASK_TRACKER_SECRET in .env.
 go run ./cmd/task-tracker add "Write the first task"
-go run ./cmd/task-tracker list
+go run ./cmd/task-tracker query 'SELECT id, status, title FROM task_overview'
 go run ./cmd/task-tracker serve
 ```
 
@@ -28,13 +28,17 @@ By default, application data lives in the operating system's user config directo
 
 ```text
 task-tracker add [--description text] [--depends-on id,id] <title>
-task-tracker list [--json]
+task-tracker query <read-only-sql>
 task-tracker done <task-id>
 task-tracker serve
 task-tracker version
 ```
 
-The CLI, web UI, and MCP tools all call `internal/task.Service`; there are no interface-specific task implementations.
+The CLI has no `list` or `show` shortcut. Every user-facing read goes through read-only SQL and is returned as structured JSON. The web UI uses fixed SQL against the same projection, while mutations from every interface still go through `internal/task.Service`.
+
+```sh
+task-tracker query 'SELECT id, status, blocked, title FROM task_overview ORDER BY created_at DESC'
+```
 
 ## MCP
 
@@ -55,11 +59,14 @@ WHERE type IN ('table', 'view')
 ORDER BY name;
 ```
 
-The query connection uses SQLite `PRAGMA query_only = ON`; the MCP layer also rejects statements that do not begin with `SELECT`, `WITH`, or `EXPLAIN`. The exposed tables are:
+The query connection uses SQLite `PRAGMA query_only = ON`; the CLI and MCP layers also reject statements that do not begin with `SELECT`, `WITH`, or `EXPLAIN`. The intentionally small schema is:
 
 - `tasks(id, title, description, status, created_at, updated_at)`
-- `task_dependencies(task_id, dependency_id)`
-- `task_attachments(task_id, object_key, name, content_type)`
+- `dependencies(task_id, depends_on_id)`
+- `images(task_id, object_key, name, content_type)`
+- `task_overview`: all task columns plus `blocked`, `dependency_count`, and `image_count`
+
+`blocked` is `1` when at least one dependency is not done and `0` otherwise. Agents can discover the schema directly through `sqlite_schema`; there are no non-SQL read tools.
 
 OAuth clients, authorization codes, access tokens, and browser sessions are currently in memory. Restarting the server signs everyone out. This is suitable for a basic single-instance deployment; a durable/distributed token store is the next step before horizontal scaling.
 

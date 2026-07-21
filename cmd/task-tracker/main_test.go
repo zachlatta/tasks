@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestCLIAddListAndComplete(t *testing.T) {
+func TestCLIAddQueryAndComplete(t *testing.T) {
 	t.Setenv("TASK_TRACKER_DATA_DIR", t.TempDir())
 	var output bytes.Buffer
 	var errors bytes.Buffer
@@ -21,11 +21,11 @@ func TestCLIAddListAndComplete(t *testing.T) {
 
 	output.Reset()
 	errors.Reset()
-	if code := run([]string{"list"}, &output, &errors); code != 0 {
-		t.Fatalf("list exit = %d; stderr: %s", code, errors.String())
+	if code := run([]string{"query", "SELECT id, status, title FROM task_overview"}, &output, &errors); code != 0 {
+		t.Fatalf("query exit = %d; stderr: %s", code, errors.String())
 	}
 	if !strings.Contains(output.String(), id) || !strings.Contains(output.String(), "todo") || !strings.Contains(output.String(), "Test the CLI") {
-		t.Fatalf("list output = %q", output.String())
+		t.Fatalf("query output = %q", output.String())
 	}
 
 	output.Reset()
@@ -34,11 +34,35 @@ func TestCLIAddListAndComplete(t *testing.T) {
 		t.Fatalf("done exit = %d; stderr: %s", code, errors.String())
 	}
 	output.Reset()
-	if code := run([]string{"list", "--json"}, &output, &errors); code != 0 {
-		t.Fatalf("JSON list exit = %d; stderr: %s", code, errors.String())
+	if code := run([]string{"query", "SELECT status FROM tasks WHERE id = '" + id + "'"}, &output, &errors); code != 0 {
+		t.Fatalf("status query exit = %d; stderr: %s", code, errors.String())
 	}
 	if !strings.Contains(output.String(), `"status": "done"`) {
-		t.Fatalf("JSON list output = %q", output.String())
+		t.Fatalf("status query output = %q", output.String())
+	}
+}
+
+func TestCLIHasNoListCommand(t *testing.T) {
+	t.Setenv("TASK_TRACKER_DATA_DIR", t.TempDir())
+	var output bytes.Buffer
+	var errors bytes.Buffer
+	if code := run([]string{"list"}, &output, &errors); code != 2 {
+		t.Fatalf("list exit = %d, want 2", code)
+	}
+	if !strings.Contains(errors.String(), `unknown command "list"`) {
+		t.Fatalf("stderr = %q", errors.String())
+	}
+}
+
+func TestCLIQueryRejectsWrites(t *testing.T) {
+	t.Setenv("TASK_TRACKER_DATA_DIR", t.TempDir())
+	var output bytes.Buffer
+	var errors bytes.Buffer
+	if code := run([]string{"query", "DELETE FROM tasks"}, &output, &errors); code != 1 {
+		t.Fatalf("query exit = %d, want 1", code)
+	}
+	if !strings.Contains(errors.String(), "only read-only") {
+		t.Fatalf("stderr = %q", errors.String())
 	}
 }
 

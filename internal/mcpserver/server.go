@@ -38,7 +38,7 @@ func New(tasks *task.Service, readModel *query.ReadModel, version string) *mcp.S
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query_tasks_sql",
 		Title:       "Query tasks with read-only SQL",
-		Description: "Runs trusted, read-only SQLite queries. Tables: tasks, task_dependencies, task_attachments. Results are capped at 500 rows. Use sqlite_schema to inspect the schema.",
+		Description: "Runs trusted, read-only SQLite queries. Tables: tasks, dependencies, images. View: task_overview. Results are capped at 500 rows. Use sqlite_schema to inspect the schema.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input SQLQueryInput) (*mcp.CallToolResult, SQLQueryOutput, error) {
 		items, err := tasks.List(ctx)

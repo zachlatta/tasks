@@ -65,7 +65,7 @@ func TestToolsCreateQueryAndCompleteTasks(t *testing.T) {
 		t.Fatalf("create dependent task: %v", err)
 	}
 	queryResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query_tasks_sql", Arguments: map[string]any{
-		"sql": "SELECT id, status FROM tasks ORDER BY id",
+		"sql": "SELECT id, status, blocked FROM task_overview ORDER BY id",
 	}})
 	if err != nil {
 		t.Fatalf("query tasks: %v", err)

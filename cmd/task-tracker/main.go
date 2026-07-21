@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"github.com/zachlatta/task-tracker/internal/app"
@@ -67,33 +66,37 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "created %s\n", created.ID)
 		return 0
-	case "list":
-		flags := flag.NewFlagSet("list", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		asJSON := flags.Bool("json", false, "write JSON")
-		if err := flags.Parse(args[1:]); err != nil {
+	case "query":
+		if len(args) < 2 {
+			fmt.Fprintln(stderr, "Usage: task-tracker query <read-only-sql>")
 			return 2
 		}
-		items, err := service.List(context.Background())
+		readModel, err := query.Open(filepath.Join(loaded.DataDir, "tasks.db"))
 		if err != nil {
-			fmt.Fprintf(stderr, "list tasks: %v\n", err)
+			fmt.Fprintf(stderr, "open task query database: %v\n", err)
 			return 1
 		}
-		if *asJSON {
-			encoder := json.NewEncoder(stdout)
-			encoder.SetIndent("", "  ")
-			if err := encoder.Encode(items); err != nil {
-				fmt.Fprintf(stderr, "encode tasks: %v\n", err)
-				return 1
-			}
-			return 0
+		defer readModel.Close()
+		items, err := service.List(context.Background())
+		if err != nil {
+			fmt.Fprintf(stderr, "refresh task query database: %v\n", err)
+			return 1
 		}
-		writer := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(writer, "ID\tSTATUS\tTITLE")
-		for _, item := range items {
-			fmt.Fprintf(writer, "%s\t%s\t%s\n", item.ID, item.Status, item.Title)
+		if err := readModel.Sync(context.Background(), items); err != nil {
+			fmt.Fprintf(stderr, "refresh task query database: %v\n", err)
+			return 1
 		}
-		_ = writer.Flush()
+		result, err := readModel.Query(context.Background(), strings.Join(args[1:], " "))
+		if err != nil {
+			fmt.Fprintf(stderr, "query tasks: %v\n", err)
+			return 1
+		}
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(result); err != nil {
+			fmt.Fprintf(stderr, "encode query result: %v\n", err)
+			return 1
+		}
 		return 0
 	case "done":
 		if len(args) != 2 {
@@ -146,7 +149,7 @@ func serve(loaded config.Config, service *task.Service, stdout, stderr io.Writer
 	defer readModel.Close()
 	oauthServer := auth.NewServer(auth.Config{Issuer: loaded.PublicURL, Secret: loaded.Secret})
 	webHandler := web.New(web.Config{
-		Tasks: service, Objects: objects, Auth: oauthServer, SecureCookies: loaded.SecureCookies(),
+		Tasks: service, ReadModel: readModel, Objects: objects, Auth: oauthServer, SecureCookies: loaded.SecureCookies(),
 	})
 	handler, err := app.NewHTTPHandler(webHandler, oauthServer, mcpserver.New(service, readModel, version), loaded.PublicURL)
 	if err != nil {
@@ -192,7 +195,7 @@ func configuredObjectStore(loaded config.Config) (objectstore.Store, error) {
 func usage(output io.Writer) {
 	fmt.Fprintln(output, `Usage:
   task-tracker add [--description text] [--depends-on id,id] <title>
-  task-tracker list [--json]
+  task-tracker query <read-only-sql>
   task-tracker done <task-id>
   task-tracker serve
   task-tracker version`)
