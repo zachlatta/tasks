@@ -4,12 +4,17 @@ import (
 	"context"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/zachlatta/task-tracker/internal/query"
+	"github.com/zachlatta/task-tracker/internal/postgres"
 	"github.com/zachlatta/task-tracker/internal/task"
 )
 
+// Reader runs trusted, read-only SQL against the task tables for agents.
+type Reader interface {
+	Query(ctx context.Context, statement string) (postgres.Result, error)
+}
+
 type SQLQueryInput struct {
-	SQL string `json:"sql" jsonschema:"A read-only SQLite SELECT, WITH, or EXPLAIN query against the task schema."`
+	SQL string `json:"sql" jsonschema:"A read-only PostgreSQL SELECT, WITH, or EXPLAIN query against the task schema."`
 }
 
 type SQLQueryOutput struct {
@@ -28,7 +33,7 @@ type CompleteTaskInput struct {
 	ID string `json:"id" jsonschema:"ID of the task to complete."`
 }
 
-func New(tasks *task.Service, readModel *query.ReadModel, version string) *mcp.Server {
+func New(tasks *task.Service, reader Reader, version string) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "task-tracker",
 		Title:   "Task Tracker",
@@ -38,17 +43,10 @@ func New(tasks *task.Service, readModel *query.ReadModel, version string) *mcp.S
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query_tasks_sql",
 		Title:       "Query tasks with read-only SQL",
-		Description: "Runs trusted, read-only SQLite queries. Tables: tasks, dependencies, images. View: task_overview. Results are capped at 500 rows. Use sqlite_schema to inspect the schema.",
+		Description: "Runs trusted, read-only PostgreSQL queries. Tables: tasks, dependencies, images. View: task_overview. Results are capped at 500 rows. Inspect the schema via information_schema.columns.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input SQLQueryInput) (*mcp.CallToolResult, SQLQueryOutput, error) {
-		items, err := tasks.List(ctx)
-		if err != nil {
-			return nil, SQLQueryOutput{}, err
-		}
-		if err := readModel.Sync(ctx, items); err != nil {
-			return nil, SQLQueryOutput{}, err
-		}
-		result, err := readModel.Query(ctx, input.SQL)
+		result, err := reader.Query(ctx, input.SQL)
 		if err != nil {
 			return nil, SQLQueryOutput{}, err
 		}
@@ -57,7 +55,7 @@ func New(tasks *task.Service, readModel *query.ReadModel, version string) *mcp.S
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "create_task",
 		Title:       "Create a task",
-		Description: "Creates a todo task in the shared Markdown backend. Dependencies must name existing task IDs.",
+		Description: "Creates a todo task in the shared Postgres backend. Dependencies must name existing task IDs.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPointer(false), OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input CreateTaskInput) (*mcp.CallToolResult, task.Task, error) {
 		created, err := tasks.Create(ctx, task.CreateInput{

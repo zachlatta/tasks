@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -20,10 +19,9 @@ import (
 	"github.com/zachlatta/task-tracker/internal/app"
 	"github.com/zachlatta/task-tracker/internal/auth"
 	"github.com/zachlatta/task-tracker/internal/config"
-	"github.com/zachlatta/task-tracker/internal/markdown"
 	"github.com/zachlatta/task-tracker/internal/mcpserver"
 	"github.com/zachlatta/task-tracker/internal/objectstore"
-	"github.com/zachlatta/task-tracker/internal/query"
+	"github.com/zachlatta/task-tracker/internal/postgres"
 	"github.com/zachlatta/task-tracker/internal/task"
 	"github.com/zachlatta/task-tracker/internal/web"
 )
@@ -39,12 +37,36 @@ func run(args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
+	switch args[0] {
+	case "version", "--version", "-version":
+		fmt.Fprintln(stdout, version)
+		return 0
+	case "help", "--help", "-h":
+		usage(stdout)
+		return 0
+	case "add", "query", "done", "serve":
+		// These commands operate on stored tasks and need the database below.
+	default:
+		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
+		usage(stderr)
+		return 2
+	}
 	loaded, err := config.Load(".env")
 	if err != nil {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return 1
 	}
-	service := task.NewService(markdown.NewStore(filepath.Join(loaded.DataDir, "tasks")), time.Now, func() string {
+	if strings.TrimSpace(loaded.DatabaseURL) == "" {
+		fmt.Fprintln(stderr, "configuration: TASK_TRACKER_DATABASE_URL is required")
+		return 1
+	}
+	store, err := postgres.Open(context.Background(), loaded.DatabaseURL)
+	if err != nil {
+		fmt.Fprintf(stderr, "database: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+	service := task.NewService(store, time.Now, func() string {
 		return strings.ToLower(rand.Text())
 	})
 	switch args[0] {
@@ -71,22 +93,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "Usage: task-tracker query <read-only-sql>")
 			return 2
 		}
-		readModel, err := query.Open(filepath.Join(loaded.DataDir, "tasks.db"))
-		if err != nil {
-			fmt.Fprintf(stderr, "open task query database: %v\n", err)
-			return 1
-		}
-		defer readModel.Close()
-		items, err := service.List(context.Background())
-		if err != nil {
-			fmt.Fprintf(stderr, "refresh task query database: %v\n", err)
-			return 1
-		}
-		if err := readModel.Sync(context.Background(), items); err != nil {
-			fmt.Fprintf(stderr, "refresh task query database: %v\n", err)
-			return 1
-		}
-		result, err := readModel.Query(context.Background(), strings.Join(args[1:], " "))
+		result, err := store.Query(context.Background(), strings.Join(args[1:], " "))
 		if err != nil {
 			fmt.Fprintf(stderr, "query tasks: %v\n", err)
 			return 1
@@ -119,39 +126,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "configuration: %v\n", err)
 			return 1
 		}
-		if err := serve(loaded, service, stdout, stderr); err != nil {
+		if err := serve(loaded, service, store, stdout, stderr); err != nil {
 			fmt.Fprintf(stderr, "serve: %v\n", err)
 			return 1
 		}
 		return 0
-	case "version", "--version", "-version":
-		fmt.Fprintln(stdout, version)
-		return 0
-	case "help", "--help", "-h":
-		usage(stdout)
-		return 0
-	default:
-		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
-		usage(stderr)
-		return 2
 	}
+	return 0
 }
 
-func serve(loaded config.Config, service *task.Service, stdout, stderr io.Writer) error {
+func serve(loaded config.Config, service *task.Service, store *postgres.Store, stdout, stderr io.Writer) error {
 	objects, err := configuredObjectStore(loaded)
 	if err != nil {
 		return err
 	}
-	readModel, err := query.Open(filepath.Join(loaded.DataDir, "tasks.db"))
-	if err != nil {
-		return err
-	}
-	defer readModel.Close()
 	oauthServer := auth.NewServer(auth.Config{Issuer: loaded.PublicURL, Secret: loaded.Secret})
 	webHandler := web.New(web.Config{
-		Tasks: service, ReadModel: readModel, Objects: objects, Auth: oauthServer, SecureCookies: loaded.SecureCookies(),
+		Tasks: service, Reader: store, Objects: objects, Auth: oauthServer, SecureCookies: loaded.SecureCookies(),
 	})
-	handler, err := app.NewHTTPHandler(webHandler, oauthServer, mcpserver.New(service, readModel, version), loaded.PublicURL)
+	handler, err := app.NewHTTPHandler(webHandler, oauthServer, mcpserver.New(service, store, version), loaded.PublicURL)
 	if err != nil {
 		return err
 	}

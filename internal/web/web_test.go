@@ -14,10 +14,9 @@ import (
 	"time"
 
 	"github.com/zachlatta/task-tracker/internal/auth"
-	"github.com/zachlatta/task-tracker/internal/markdown"
 	"github.com/zachlatta/task-tracker/internal/objectstore"
-	"github.com/zachlatta/task-tracker/internal/query"
 	"github.com/zachlatta/task-tracker/internal/task"
+	"github.com/zachlatta/task-tracker/internal/tasktest"
 )
 
 func TestLoginProtectsTaskPage(t *testing.T) {
@@ -112,17 +111,13 @@ func TestCreateCompleteAndUploadImage(t *testing.T) {
 func testHandler(t *testing.T) (http.Handler, *task.Service) {
 	t.Helper()
 	root := t.TempDir()
-	service := task.NewService(markdown.NewStore(filepath.Join(root, "tasks")), time.Now, func() string { return strings.ToLower(t.Name()) + "-id" })
-	readModel, err := query.Open(filepath.Join(root, "tasks.db"))
-	if err != nil {
-		t.Fatalf("open read model: %v", err)
-	}
-	t.Cleanup(func() { readModel.Close() })
+	repo := tasktest.NewRepository()
+	service := task.NewService(repo, time.Now, func() string { return strings.ToLower(t.Name()) + "-id" })
 	handler := New(Config{
-		Tasks:     service,
-		ReadModel: readModel,
-		Objects:   objectstore.NewLocal(filepath.Join(root, "objects")),
-		Auth:      auth.NewServer(auth.Config{Issuer: "http://tasks.example.com", Secret: "shared-secret"}),
+		Tasks:   service,
+		Reader:  repo,
+		Objects: objectstore.NewLocal(filepath.Join(root, "objects")),
+		Auth:    auth.NewServer(auth.Config{Issuer: "http://tasks.example.com", Secret: "shared-secret"}),
 	})
 	return handler, service
 }

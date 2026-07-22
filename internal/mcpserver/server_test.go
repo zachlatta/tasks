@@ -3,33 +3,31 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/zachlatta/task-tracker/internal/markdown"
-	"github.com/zachlatta/task-tracker/internal/query"
+	"github.com/zachlatta/task-tracker/internal/pgtest"
+	"github.com/zachlatta/task-tracker/internal/postgres"
 	"github.com/zachlatta/task-tracker/internal/task"
 )
 
 func TestToolsCreateQueryAndCompleteTasks(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	store, err := postgres.Open(context.Background(), pgtest.URL(t))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(store.Close)
 	ids := []string{"write-tests", "ship-feature"}
-	service := task.NewService(markdown.NewStore(filepath.Join(root, "tasks")), time.Now, func() string {
+	service := task.NewService(store, time.Now, func() string {
 		id := ids[0]
 		ids = ids[1:]
 		return id
 	})
-	readModel, err := query.Open(filepath.Join(root, "tasks.db"))
-	if err != nil {
-		t.Fatalf("open read model: %v", err)
-	}
-	t.Cleanup(func() { readModel.Close() })
-	server := New(service, readModel, "test")
+	server := New(service, store, "test")
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

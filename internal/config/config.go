@@ -16,6 +16,7 @@ type Config struct {
 	Address        string
 	PublicURL      string
 	Secret         string
+	DatabaseURL    string
 	DataDir        string
 	ObjectBackend  string
 	LocalObjectDir string
@@ -72,6 +73,7 @@ func Load(dotenvPath string) (Config, error) {
 		Address:        address,
 		PublicURL:      strings.TrimRight(get("TASK_TRACKER_PUBLIC_URL", "http://"+publicAddress), "/"),
 		Secret:         get("TASK_TRACKER_SECRET", ""),
+		DatabaseURL:    get("TASK_TRACKER_DATABASE_URL", ""),
 		DataDir:        dataDirectory,
 		ObjectBackend:  strings.ToLower(get("TASK_TRACKER_OBJECT_STORE", "local")),
 		LocalObjectDir: get("TASK_TRACKER_LOCAL_OBJECT_DIR", filepath.Join(dataDirectory, "images")),
@@ -89,6 +91,9 @@ func Load(dotenvPath string) (Config, error) {
 func (c Config) ValidateServer() error {
 	if c.Secret == "" {
 		return errors.New("TASK_TRACKER_SECRET is required to serve the web and MCP endpoints")
+	}
+	if c.DatabaseURL == "" {
+		return errors.New("TASK_TRACKER_DATABASE_URL is required to store tasks")
 	}
 	parsed, err := url.Parse(c.PublicURL)
 	if err != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" {

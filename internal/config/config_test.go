@@ -9,7 +9,7 @@ import (
 func TestLoadUsesEnvironmentBeforeDotEnv(t *testing.T) {
 	directory := t.TempDir()
 	dotenv := filepath.Join(directory, ".env")
-	if err := os.WriteFile(dotenv, []byte("TASK_TRACKER_SECRET=from-file\nTASK_TRACKER_ADDR=127.0.0.1:7000\nTASK_TRACKER_DATA_DIR="+filepath.Join(directory, "data")+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(dotenv, []byte("TASK_TRACKER_SECRET=from-file\nTASK_TRACKER_ADDR=127.0.0.1:7000\nTASK_TRACKER_DATABASE_URL=postgres://localhost:5432/tasks\nTASK_TRACKER_DATA_DIR="+filepath.Join(directory, "data")+"\n"), 0o600); err != nil {
 		t.Fatalf("write .env: %v", err)
 	}
 	t.Setenv("TASK_TRACKER_ADDR", "127.0.0.1:9000")
@@ -28,8 +28,9 @@ func TestLoadUsesEnvironmentBeforeDotEnv(t *testing.T) {
 
 func TestValidateServerRequiresSecretAndSafePublicURL(t *testing.T) {
 	for name, candidate := range map[string]Config{
-		"missing secret":      {PublicURL: "http://127.0.0.1:8080"},
-		"insecure remote URL": {Secret: "secret", PublicURL: "http://tasks.example.com"},
+		"missing secret":      {DatabaseURL: "postgres://localhost/tasks", PublicURL: "http://127.0.0.1:8080"},
+		"missing database":    {Secret: "secret", PublicURL: "http://127.0.0.1:8080"},
+		"insecure remote URL": {Secret: "secret", DatabaseURL: "postgres://localhost/tasks", PublicURL: "http://tasks.example.com"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := candidate.ValidateServer(); err == nil {

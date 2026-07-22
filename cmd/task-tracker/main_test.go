@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/zachlatta/task-tracker/internal/pgtest"
 )
 
 func TestCLIAddQueryAndComplete(t *testing.T) {
-	t.Setenv("TASK_TRACKER_DATA_DIR", t.TempDir())
+	t.Setenv("TASK_TRACKER_DATABASE_URL", pgtest.URL(t))
 	var output bytes.Buffer
 	var errors bytes.Buffer
 	if code := run([]string{"add", "Test the CLI"}, &output, &errors); code != 0 {
@@ -43,7 +45,7 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 }
 
 func TestCLIHasNoListCommand(t *testing.T) {
-	t.Setenv("TASK_TRACKER_DATA_DIR", t.TempDir())
+	// "list" is rejected as an unknown command before any database connection.
 	var output bytes.Buffer
 	var errors bytes.Buffer
 	if code := run([]string{"list"}, &output, &errors); code != 2 {
@@ -55,7 +57,7 @@ func TestCLIHasNoListCommand(t *testing.T) {
 }
 
 func TestCLIQueryRejectsWrites(t *testing.T) {
-	t.Setenv("TASK_TRACKER_DATA_DIR", t.TempDir())
+	t.Setenv("TASK_TRACKER_DATABASE_URL", pgtest.URL(t))
 	var output bytes.Buffer
 	var errors bytes.Buffer
 	if code := run([]string{"query", "DELETE FROM tasks"}, &output, &errors); code != 1 {
