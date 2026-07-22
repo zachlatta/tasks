@@ -123,6 +123,7 @@ Install the latest `main` build through the repository's Homebrew tap:
 
 ```sh
 brew tap zachlatta/task-tracker https://github.com/zachlatta/task-tracker
+brew trust --tap zachlatta/task-tracker
 brew install task-tracker
 ```
 
