@@ -67,6 +67,58 @@ func TestStoreRoundTripLoadsChildren(t *testing.T) {
 	}
 }
 
+func TestGetAndListAttachOnlyOwnChildren(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+
+	mustCreate(t, store, task.Task{ID: "dep-a", Title: "Dep A", Status: task.StatusDone, CreatedAt: now, UpdatedAt: now})
+	mustCreate(t, store, task.Task{ID: "dep-b", Title: "Dep B", Status: task.StatusDone, CreatedAt: now, UpdatedAt: now})
+	mustCreate(t, store, task.Task{
+		ID: "first", Title: "First", Status: task.StatusTodo,
+		Dependencies: []string{"dep-a"},
+		Attachments:  []task.Attachment{{Key: "first/x.png", Name: "x.png", ContentType: "image/png"}},
+		CreatedAt:    now, UpdatedAt: now,
+	})
+	mustCreate(t, store, task.Task{
+		ID: "second", Title: "Second", Status: task.StatusTodo,
+		Dependencies: []string{"dep-b"},
+		Attachments:  []task.Attachment{{Key: "second/y.png", Name: "y.png", ContentType: "image/png"}},
+		CreatedAt:    now, UpdatedAt: now,
+	})
+
+	// Get must attach only the requested task's children, not a sibling's.
+	first, err := store.Get(ctx, "first")
+	if err != nil {
+		t.Fatalf("get first: %v", err)
+	}
+	if len(first.Dependencies) != 1 || first.Dependencies[0] != "dep-a" {
+		t.Fatalf("first dependencies = %v, want [dep-a]", first.Dependencies)
+	}
+	if len(first.Attachments) != 1 || first.Attachments[0].Key != "first/x.png" {
+		t.Fatalf("first attachments = %#v, want only first/x.png", first.Attachments)
+	}
+
+	// List must attach each task's own children across the whole set.
+	items, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	byID := make(map[string]task.Task, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+	}
+	if deps := byID["second"].Dependencies; len(deps) != 1 || deps[0] != "dep-b" {
+		t.Fatalf("second dependencies = %v, want [dep-b]", deps)
+	}
+	if att := byID["second"].Attachments; len(att) != 1 || att[0].Key != "second/y.png" {
+		t.Fatalf("second attachments = %#v, want only second/y.png", att)
+	}
+	if deps := byID["dep-a"].Dependencies; len(deps) != 0 {
+		t.Fatalf("dep-a dependencies = %v, want none", deps)
+	}
+}
+
 func TestStoreCreateDuplicateReturnsAlreadyExists(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()

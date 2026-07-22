@@ -213,9 +213,18 @@ func (s *Store) projection(ctx context.Context, taskQuery string) ([]task.Task, 
 }
 
 func (s *Store) attachChildren(ctx context.Context, items []task.Task, index map[string]int) error {
+	if len(index) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(index))
+	for id := range index {
+		ids = append(ids, id)
+	}
 	dependencyRows, err := s.pool.Query(ctx, `
-		SELECT task_id, depends_on_id FROM dependencies ORDER BY task_id, depends_on_id
-	`)
+		SELECT task_id, depends_on_id FROM dependencies
+		WHERE task_id = ANY($1)
+		ORDER BY task_id, depends_on_id
+	`, ids)
 	if err != nil {
 		return err
 	}
@@ -233,8 +242,10 @@ func (s *Store) attachChildren(ctx context.Context, items []task.Task, index map
 		return err
 	}
 	imageRows, err := s.pool.Query(ctx, `
-		SELECT task_id, object_key, name, content_type FROM images ORDER BY task_id, object_key
-	`)
+		SELECT task_id, object_key, name, content_type FROM images
+		WHERE task_id = ANY($1)
+		ORDER BY task_id, object_key
+	`, ids)
 	if err != nil {
 		return err
 	}
