@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zachlatta/task-tracker/internal/auth"
 	"github.com/zachlatta/task-tracker/internal/pgtest"
 	"github.com/zachlatta/task-tracker/internal/task"
 )
@@ -237,5 +238,126 @@ func mustCreate(t *testing.T, store *Store, item task.Task) {
 	t.Helper()
 	if err := store.Create(context.Background(), item); err != nil {
 		t.Fatalf("create %s: %v", item.ID, err)
+	}
+}
+
+func TestOAuthClientRoundTrip(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	if _, ok, err := store.Client(ctx, "missing"); err != nil || ok {
+		t.Fatalf("Client(missing) = ok %v, err %v, want (false, nil)", ok, err)
+	}
+	client := auth.Client{
+		ID:           "client-1",
+		Name:         "Claude",
+		RedirectURIs: []string{"https://claude.ai/api/mcp/auth_callback", "http://127.0.0.1/callback"},
+	}
+	if err := store.SaveClient(ctx, client); err != nil {
+		t.Fatalf("SaveClient: %v", err)
+	}
+	got, ok, err := store.Client(ctx, "client-1")
+	if err != nil || !ok {
+		t.Fatalf("Client = ok %v, err %v", ok, err)
+	}
+	if got.Name != client.Name || len(got.RedirectURIs) != 2 || got.RedirectURIs[0] != client.RedirectURIs[0] {
+		t.Fatalf("client = %#v", got)
+	}
+}
+
+func TestOAuthCodeSingleUse(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	future := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
+	code := auth.Code{ClientID: "c", RedirectURI: "https://x/cb", Challenge: "abc", Resource: "https://x/mcp", Scope: "tasks", ExpiresAt: future}
+	if err := store.SaveCode(ctx, "codehash", code); err != nil {
+		t.Fatalf("SaveCode: %v", err)
+	}
+	got, ok, err := store.TakeCode(ctx, "codehash")
+	if err != nil || !ok {
+		t.Fatalf("TakeCode first = ok %v, err %v", ok, err)
+	}
+	if got.ClientID != "c" || got.Scope != "tasks" || !got.ExpiresAt.Equal(future) {
+		t.Fatalf("code = %#v", got)
+	}
+	if _, ok, err := store.TakeCode(ctx, "codehash"); err != nil || ok {
+		t.Fatalf("TakeCode second = ok %v, err %v, want consumed", ok, err)
+	}
+}
+
+func TestOAuthTokenRoundTrip(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	future := time.Date(2026, time.July, 20, 13, 0, 0, 0, time.UTC)
+	if err := store.SaveToken(ctx, "tokhash", auth.Token{ClientID: "c", Resource: "https://x/mcp", Scope: "tasks", ExpiresAt: future}); err != nil {
+		t.Fatalf("SaveToken: %v", err)
+	}
+	got, ok, err := store.Token(ctx, "tokhash")
+	if err != nil || !ok {
+		t.Fatalf("Token = ok %v, err %v", ok, err)
+	}
+	if got.Resource != "https://x/mcp" || !got.ExpiresAt.Equal(future) {
+		t.Fatalf("token = %#v", got)
+	}
+	if _, ok, _ := store.Token(ctx, "nope"); ok {
+		t.Fatal("Token(nope) ok = true, want false")
+	}
+}
+
+func TestSessionRoundTripAndDelete(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	future := time.Date(2026, time.July, 20, 14, 0, 0, 0, time.UTC)
+	if err := store.SaveSession(ctx, "sess", "csrf-1", future); err != nil {
+		t.Fatalf("SaveSession: %v", err)
+	}
+	csrf, expiresAt, ok, err := store.Session(ctx, "sess")
+	if err != nil || !ok || csrf != "csrf-1" || !expiresAt.Equal(future) {
+		t.Fatalf("Session = %q %v %v %v", csrf, expiresAt, ok, err)
+	}
+	if err := store.DeleteSession(ctx, "sess"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if _, _, ok, _ := store.Session(ctx, "sess"); ok {
+		t.Fatal("session still present after delete")
+	}
+}
+
+func TestDeleteExpiredAuthState(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Minute)
+	future := now.Add(time.Hour)
+
+	if err := store.SaveCode(ctx, "old-code", auth.Code{ClientID: "c", RedirectURI: "u", Challenge: "x", Resource: "r", Scope: "tasks", ExpiresAt: past}); err != nil {
+		t.Fatalf("SaveCode: %v", err)
+	}
+	if err := store.SaveToken(ctx, "old-tok", auth.Token{ClientID: "c", Resource: "r", Scope: "tasks", ExpiresAt: past}); err != nil {
+		t.Fatalf("SaveToken(old): %v", err)
+	}
+	if err := store.SaveSession(ctx, "old-sess", "csrf", past); err != nil {
+		t.Fatalf("SaveSession(old): %v", err)
+	}
+	if err := store.SaveToken(ctx, "new-tok", auth.Token{ClientID: "c", Resource: "r", Scope: "tasks", ExpiresAt: future}); err != nil {
+		t.Fatalf("SaveToken(new): %v", err)
+	}
+	if err := store.SaveSession(ctx, "new-sess", "csrf", future); err != nil {
+		t.Fatalf("SaveSession(new): %v", err)
+	}
+
+	if err := store.DeleteExpiredAuthState(ctx, now); err != nil {
+		t.Fatalf("DeleteExpiredAuthState: %v", err)
+	}
+	if _, ok, _ := store.Token(ctx, "old-tok"); ok {
+		t.Fatal("expired token survived cleanup")
+	}
+	if _, _, ok, _ := store.Session(ctx, "old-sess"); ok {
+		t.Fatal("expired session survived cleanup")
+	}
+	if _, ok, _ := store.Token(ctx, "new-tok"); !ok {
+		t.Fatal("valid token removed by cleanup")
+	}
+	if _, _, ok, _ := store.Session(ctx, "new-sess"); !ok {
+		t.Fatal("valid session removed by cleanup")
 	}
 }

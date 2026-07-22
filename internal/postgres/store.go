@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zachlatta/task-tracker/internal/auth"
 	"github.com/zachlatta/task-tracker/internal/task"
 )
 
@@ -66,6 +68,36 @@ SELECT
 	(SELECT count(*) FROM dependencies d WHERE d.task_id = t.id) AS dependency_count,
 	(SELECT count(*) FROM images i WHERE i.task_id = t.id) AS image_count
 FROM tasks t;
+CREATE TABLE IF NOT EXISTS oauth_clients (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	redirect_uris TEXT[] NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS oauth_codes (
+	code_hash TEXT PRIMARY KEY,
+	client_id TEXT NOT NULL,
+	redirect_uri TEXT NOT NULL,
+	challenge TEXT NOT NULL,
+	resource TEXT NOT NULL,
+	scope TEXT NOT NULL,
+	expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+	token_hash TEXT PRIMARY KEY,
+	client_id TEXT NOT NULL,
+	resource TEXT NOT NULL,
+	scope TEXT NOT NULL,
+	expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS web_sessions (
+	token_hash TEXT PRIMARY KEY,
+	csrf TEXT NOT NULL,
+	expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oauth_codes_expires_idx ON oauth_codes(expires_at);
+CREATE INDEX IF NOT EXISTS oauth_tokens_expires_idx ON oauth_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS web_sessions_expires_idx ON web_sessions(expires_at);
 `
 
 // Open connects to PostgreSQL, ensures the task schema exists, and returns a
@@ -357,4 +389,132 @@ func normalize(value any) any {
 		return string(bytes)
 	}
 	return value
+}
+
+// SaveClient persists (or updates) a registered OAuth client. It implements
+// auth.Store.
+func (s *Store) SaveClient(ctx context.Context, client auth.Client) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO oauth_clients (id, name, redirect_uris)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, redirect_uris = EXCLUDED.redirect_uris
+	`, client.ID, client.Name, client.RedirectURIs)
+	return err
+}
+
+// Client loads a registered OAuth client by ID. It implements auth.Store.
+func (s *Store) Client(ctx context.Context, id string) (auth.Client, bool, error) {
+	var client auth.Client
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, name, redirect_uris FROM oauth_clients WHERE id = $1
+	`, id).Scan(&client.ID, &client.Name, &client.RedirectURIs)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return auth.Client{}, false, nil
+	}
+	if err != nil {
+		return auth.Client{}, false, err
+	}
+	return client, true, nil
+}
+
+// SaveCode stores an authorization code keyed by its hash. It implements
+// auth.Store.
+func (s *Store) SaveCode(ctx context.Context, codeHash string, code auth.Code) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, challenge, resource, scope, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, codeHash, code.ClientID, code.RedirectURI, code.Challenge, code.Resource, code.Scope, code.ExpiresAt)
+	return err
+}
+
+// TakeCode atomically deletes and returns an authorization code, enforcing
+// single use. It implements auth.Store.
+func (s *Store) TakeCode(ctx context.Context, codeHash string) (auth.Code, bool, error) {
+	var code auth.Code
+	err := s.pool.QueryRow(ctx, `
+		DELETE FROM oauth_codes WHERE code_hash = $1
+		RETURNING client_id, redirect_uri, challenge, resource, scope, expires_at
+	`, codeHash).Scan(&code.ClientID, &code.RedirectURI, &code.Challenge, &code.Resource, &code.Scope, &code.ExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return auth.Code{}, false, nil
+	}
+	if err != nil {
+		return auth.Code{}, false, err
+	}
+	code.ExpiresAt = code.ExpiresAt.UTC()
+	return code, true, nil
+}
+
+// SaveToken stores an access token keyed by its hash. It implements auth.Store.
+func (s *Store) SaveToken(ctx context.Context, tokenHash string, token auth.Token) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO oauth_tokens (token_hash, client_id, resource, scope, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, tokenHash, token.ClientID, token.Resource, token.Scope, token.ExpiresAt)
+	return err
+}
+
+// Token loads an access token by its hash. It implements auth.Store.
+func (s *Store) Token(ctx context.Context, tokenHash string) (auth.Token, bool, error) {
+	var token auth.Token
+	err := s.pool.QueryRow(ctx, `
+		SELECT client_id, resource, scope, expires_at FROM oauth_tokens WHERE token_hash = $1
+	`, tokenHash).Scan(&token.ClientID, &token.Resource, &token.Scope, &token.ExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return auth.Token{}, false, nil
+	}
+	if err != nil {
+		return auth.Token{}, false, err
+	}
+	token.ExpiresAt = token.ExpiresAt.UTC()
+	return token, true, nil
+}
+
+// SaveSession persists a browser session keyed by its hash. It implements
+// web.SessionStore.
+func (s *Store) SaveSession(ctx context.Context, tokenHash, csrf string, expiresAt time.Time) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO web_sessions (token_hash, csrf, expires_at)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (token_hash) DO UPDATE SET csrf = EXCLUDED.csrf, expires_at = EXCLUDED.expires_at
+	`, tokenHash, csrf, expiresAt)
+	return err
+}
+
+// Session loads a browser session by its hash. It implements web.SessionStore.
+func (s *Store) Session(ctx context.Context, tokenHash string) (string, time.Time, bool, error) {
+	var csrf string
+	var expiresAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		SELECT csrf, expires_at FROM web_sessions WHERE token_hash = $1
+	`, tokenHash).Scan(&csrf, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	return csrf, expiresAt.UTC(), true, nil
+}
+
+// DeleteSession removes a browser session by its hash. It implements
+// web.SessionStore.
+func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM web_sessions WHERE token_hash = $1`, tokenHash)
+	return err
+}
+
+// DeleteExpiredAuthState removes expired authorization codes, access tokens,
+// and browser sessions. It is safe to call periodically.
+func (s *Store) DeleteExpiredAuthState(ctx context.Context, now time.Time) error {
+	for _, statement := range []string{
+		`DELETE FROM oauth_codes WHERE expires_at < $1`,
+		`DELETE FROM oauth_tokens WHERE expires_at < $1`,
+		`DELETE FROM web_sessions WHERE expires_at < $1`,
+	} {
+		if _, err := s.pool.Exec(ctx, statement, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }

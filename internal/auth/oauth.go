@@ -1,10 +1,12 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,12 +21,56 @@ import (
 
 const taskScope = "tasks"
 
+// Client is a registered OAuth client. Client IDs are public identifiers, so
+// they are stored verbatim.
+type Client struct {
+	ID           string
+	Name         string
+	RedirectURIs []string
+}
+
+// Code is a stored authorization code. It is keyed by a hash of the code value
+// so the raw code never lives at rest.
+type Code struct {
+	ClientID    string
+	RedirectURI string
+	Challenge   string
+	Resource    string
+	Scope       string
+	ExpiresAt   time.Time
+}
+
+// Token is a stored access token, keyed by a hash of the token value.
+type Token struct {
+	ClientID  string
+	Resource  string
+	Scope     string
+	ExpiresAt time.Time
+}
+
+// Store persists OAuth clients, authorization codes, and access tokens. Codes
+// and tokens are addressed by a hash of their secret value, never the raw
+// value. The production implementation is PostgreSQL; NewServer falls back to
+// an in-memory store when none is supplied (used by tests).
+type Store interface {
+	SaveClient(ctx context.Context, client Client) error
+	Client(ctx context.Context, id string) (Client, bool, error)
+	SaveCode(ctx context.Context, codeHash string, code Code) error
+	// TakeCode atomically returns and deletes the code, enforcing single use.
+	TakeCode(ctx context.Context, codeHash string) (Code, bool, error)
+	SaveToken(ctx context.Context, tokenHash string, token Token) error
+	Token(ctx context.Context, tokenHash string) (Token, bool, error)
+}
+
 type Config struct {
 	Issuer   string
 	Secret   string
 	CodeTTL  time.Duration
 	TokenTTL time.Duration
 	Now      func() time.Time
+	// Store persists clients, codes, and tokens. When nil, an in-memory store
+	// is used (non-durable; intended for tests and single-process use).
+	Store Store
 }
 
 type Server struct {
@@ -35,32 +81,7 @@ type Server struct {
 	codeTTL   time.Duration
 	tokenTTL  time.Duration
 	now       func() time.Time
-
-	mu      sync.Mutex
-	clients map[string]client
-	codes   map[string]authorizationCode
-	tokens  map[string]accessToken
-}
-
-type client struct {
-	ID           string
-	Name         string
-	RedirectURIs []string
-}
-
-type authorizationCode struct {
-	ClientID    string
-	RedirectURI string
-	Challenge   string
-	Resource    string
-	Scope       string
-	ExpiresAt   time.Time
-}
-
-type accessToken struct {
-	Resource  string
-	Scope     string
-	ExpiresAt time.Time
+	store     Store
 }
 
 func NewServer(config Config) *Server {
@@ -74,15 +95,16 @@ func NewServer(config Config) *Server {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
+	if config.Store == nil {
+		config.Store = newMemoryStore()
+	}
 	server := &Server{
 		issuer:    issuer,
 		resource:  issuer + "/mcp",
 		codeTTL:   config.CodeTTL,
 		tokenTTL:  config.TokenTTL,
 		now:       config.Now,
-		clients:   make(map[string]client),
-		codes:     make(map[string]authorizationCode),
-		tokens:    make(map[string]accessToken),
+		store:     config.Store,
 		hasSecret: config.Secret != "",
 	}
 	server.secret = sha256.Sum256([]byte(config.Secret))
@@ -102,7 +124,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 func (s *Server) RequireBearer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Fields(r.Header.Get("Authorization"))
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || !s.ValidToken(parts[1]) {
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || !s.ValidToken(r.Context(), parts[1]) {
 			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata=%q, scope=%q`, s.issuer+"/.well-known/oauth-protected-resource", taskScope))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -111,18 +133,15 @@ func (s *Server) RequireBearer(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) ValidToken(value string) bool {
+func (s *Server) ValidToken(ctx context.Context, value string) bool {
 	if value == "" {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	token, ok := s.tokens[value]
-	if !ok {
+	token, ok, err := s.store.Token(ctx, hashSecret(value))
+	if err != nil || !ok {
 		return false
 	}
 	if !s.now().Before(token.ExpiresAt) {
-		delete(s.tokens, value)
 		return false
 	}
 	return token.Resource == s.resource
@@ -182,18 +201,22 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if len(request.GrantTypes) > 0 && !slices.Equal(request.GrantTypes, []string{"authorization_code"}) {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "only the authorization_code grant is supported")
+	// Clients (such as Claude) commonly request extra grant/response types like
+	// refresh_token. Per RFC 7591 we register a supported subset rather than
+	// rejecting the whole request, as long as the essential ones are present.
+	if len(request.GrantTypes) > 0 && !slices.Contains(request.GrantTypes, "authorization_code") {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "the authorization_code grant is required")
 		return
 	}
-	if len(request.ResponseTypes) > 0 && !slices.Equal(request.ResponseTypes, []string{"code"}) {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "only the code response type is supported")
+	if len(request.ResponseTypes) > 0 && !slices.Contains(request.ResponseTypes, "code") {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "the code response type is required")
 		return
 	}
-	registered := client{ID: randomText(), Name: request.ClientName, RedirectURIs: slices.Clone(request.RedirectURIs)}
-	s.mu.Lock()
-	s.clients[registered.ID] = registered
-	s.mu.Unlock()
+	registered := Client{ID: randomText(), Name: request.ClientName, RedirectURIs: slices.Clone(request.RedirectURIs)}
+	if err := s.store.SaveClient(r.Context(), registered); err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist client registration")
+		return
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  registered.ID,
 		"client_name":                registered.Name,
@@ -219,7 +242,7 @@ type authorizationPageData struct {
 }
 
 func (s *Server) authorizePage(w http.ResponseWriter, r *http.Request) {
-	request, err := s.parseAuthorizationRequest(r.URL.Query())
+	request, err := s.parseAuthorizationRequest(r.Context(), r.URL.Query())
 	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -236,7 +259,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form")
 		return
 	}
-	request, err := s.parseAuthorizationRequest(r.PostForm)
+	request, err := s.parseAuthorizationRequest(r.Context(), r.PostForm)
 	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -249,8 +272,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	code := randomText()
-	s.mu.Lock()
-	s.codes[code] = authorizationCode{
+	stored := Code{
 		ClientID:    request.ClientID,
 		RedirectURI: request.RedirectURI,
 		Challenge:   request.Challenge,
@@ -258,7 +280,10 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		Scope:       request.Scope,
 		ExpiresAt:   s.now().Add(s.codeTTL),
 	}
-	s.mu.Unlock()
+	if err := s.store.SaveCode(r.Context(), hashSecret(code), stored); err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist authorization code")
+		return
+	}
 	redirect, _ := url.Parse(request.RedirectURI)
 	query := redirect.Query()
 	query.Set("code", code)
@@ -269,7 +294,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirect.String(), http.StatusFound)
 }
 
-func (s *Server) parseAuthorizationRequest(values url.Values) (authorizationRequest, error) {
+func (s *Server) parseAuthorizationRequest(ctx context.Context, values url.Values) (authorizationRequest, error) {
 	request := authorizationRequest{
 		ClientID:    values.Get("client_id"),
 		RedirectURI: values.Get("redirect_uri"),
@@ -287,9 +312,10 @@ func (s *Server) parseAuthorizationRequest(values url.Values) (authorizationRequ
 	if request.Resource != s.resource {
 		return authorizationRequest{}, errors.New("resource does not identify this MCP server")
 	}
-	s.mu.Lock()
-	registered, ok := s.clients[request.ClientID]
-	s.mu.Unlock()
+	registered, ok, err := s.store.Client(ctx, request.ClientID)
+	if err != nil {
+		return authorizationRequest{}, errors.New("could not look up client")
+	}
 	if !ok || !slices.Contains(registered.RedirectURIs, request.RedirectURI) {
 		return authorizationRequest{}, errors.New("unknown client or redirect URI")
 	}
@@ -315,13 +341,11 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "only authorization_code is supported")
 		return
 	}
-	codeValue := r.PostForm.Get("code")
-	s.mu.Lock()
-	code, ok := s.codes[codeValue]
-	if ok {
-		delete(s.codes, codeValue)
+	code, ok, err := s.store.TakeCode(r.Context(), hashSecret(r.PostForm.Get("code")))
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not read authorization code")
+		return
 	}
-	s.mu.Unlock()
 	if !ok || !s.now().Before(code.ExpiresAt) || code.ClientID != r.PostForm.Get("client_id") || code.RedirectURI != r.PostForm.Get("redirect_uri") || code.Resource != r.PostForm.Get("resource") {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid or expired")
 		return
@@ -339,9 +363,10 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	}
 	value := randomText()
 	expiresAt := s.now().Add(s.tokenTTL)
-	s.mu.Lock()
-	s.tokens[value] = accessToken{Resource: code.Resource, Scope: code.Scope, ExpiresAt: expiresAt}
-	s.mu.Unlock()
+	if err := s.store.SaveToken(r.Context(), hashSecret(value), Token{ClientID: code.ClientID, Resource: code.Resource, Scope: code.Scope, ExpiresAt: expiresAt}); err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist access token")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": value,
 		"token_type":   "Bearer",
@@ -369,6 +394,14 @@ func randomText() string {
 	return rand.Text()
 }
 
+// hashSecret returns a hex-encoded SHA-256 of a high-entropy secret (code or
+// token). These values are random, so a plain hash is sufficient to keep the
+// raw secret out of storage while allowing constant-time lookup by key.
+func hashSecret(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
 func writeOAuthError(w http.ResponseWriter, status int, code, description string) {
 	writeJSON(w, status, map[string]string{"error": code, "error_description": description})
 }
@@ -377,6 +410,72 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+// memoryStore is a non-durable Store used when no persistent store is
+// configured (tests and single-process fallback).
+type memoryStore struct {
+	mu      sync.Mutex
+	clients map[string]Client
+	codes   map[string]Code
+	tokens  map[string]Token
+}
+
+func newMemoryStore() *memoryStore {
+	return &memoryStore{
+		clients: make(map[string]Client),
+		codes:   make(map[string]Code),
+		tokens:  make(map[string]Token),
+	}
+}
+
+func (m *memoryStore) SaveClient(_ context.Context, client Client) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	client.RedirectURIs = slices.Clone(client.RedirectURIs)
+	m.clients[client.ID] = client
+	return nil
+}
+
+func (m *memoryStore) Client(_ context.Context, id string) (Client, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	client, ok := m.clients[id]
+	if ok {
+		client.RedirectURIs = slices.Clone(client.RedirectURIs)
+	}
+	return client, ok, nil
+}
+
+func (m *memoryStore) SaveCode(_ context.Context, codeHash string, code Code) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.codes[codeHash] = code
+	return nil
+}
+
+func (m *memoryStore) TakeCode(_ context.Context, codeHash string) (Code, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	code, ok := m.codes[codeHash]
+	if ok {
+		delete(m.codes, codeHash)
+	}
+	return code, ok, nil
+}
+
+func (m *memoryStore) SaveToken(_ context.Context, tokenHash string, token Token) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tokens[tokenHash] = token
+	return nil
+}
+
+func (m *memoryStore) Token(_ context.Context, tokenHash string) (Token, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	token, ok := m.tokens[tokenHash]
+	return token, ok, nil
 }
 
 var authorizationPage = template.Must(template.New("authorize").Parse(`<!doctype html>

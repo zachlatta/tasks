@@ -3,7 +3,9 @@ package web
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"html/template"
 	"io"
@@ -25,6 +27,16 @@ type Reader interface {
 	Tasks(ctx context.Context) ([]task.Task, error)
 }
 
+// SessionStore persists browser sessions keyed by a hash of the session cookie
+// value, so the raw cookie is never stored at rest. In production it is the
+// PostgreSQL store; New falls back to an in-memory store when none is supplied
+// (used by tests).
+type SessionStore interface {
+	SaveSession(ctx context.Context, tokenHash, csrf string, expiresAt time.Time) error
+	Session(ctx context.Context, tokenHash string) (csrf string, expiresAt time.Time, ok bool, err error)
+	DeleteSession(ctx context.Context, tokenHash string) error
+}
+
 const (
 	sessionCookie = "task_tracker_session"
 	sessionTTL    = 12 * time.Hour
@@ -41,6 +53,9 @@ type Config struct {
 	Auth          *auth.Server
 	SecureCookies bool
 	Now           func() time.Time
+	// Sessions persists browser sessions. When nil, an in-memory store is used
+	// (non-durable; intended for tests and single-process use).
+	Sessions SessionStore
 }
 
 type handler struct {
@@ -52,9 +67,7 @@ type handler struct {
 	now           func() time.Time
 	templates     *template.Template
 	mux           *http.ServeMux
-
-	mu       sync.Mutex
-	sessions map[string]session
+	sessions      SessionStore
 }
 
 type session struct {
@@ -75,6 +88,9 @@ func New(config Config) http.Handler {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
+	if config.Sessions == nil {
+		config.Sessions = newMemorySessionStore()
+	}
 	h := &handler{
 		tasks:         config.Tasks,
 		reader:        config.Reader,
@@ -84,7 +100,7 @@ func New(config Config) http.Handler {
 		now:           config.Now,
 		templates:     template.Must(template.ParseFS(assets, "templates/*.html")),
 		mux:           http.NewServeMux(),
-		sessions:      make(map[string]session),
+		sessions:      config.Sessions,
 	}
 	h.mux.HandleFunc("GET /static/app.css", h.styles)
 	h.mux.HandleFunc("GET /login", h.loginPage)
@@ -117,9 +133,10 @@ func (h *handler) login(w http.ResponseWriter, r *http.Request) {
 	now := h.now()
 	token := rand.Text()
 	current := session{CSRF: rand.Text(), ExpiresAt: now.Add(sessionTTL)}
-	h.mu.Lock()
-	h.sessions[token] = current
-	h.mu.Unlock()
+	if err := h.sessions.SaveSession(r.Context(), hashToken(token), current.CSRF, current.ExpiresAt); err != nil {
+		h.render(w, http.StatusInternalServerError, "login.html", pageData{Error: "Could not start a session. Please try again."})
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
@@ -139,9 +156,7 @@ func (h *handler) logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cookie, err := r.Cookie(sessionCookie); err == nil {
-		h.mu.Lock()
-		delete(h.sessions, cookie.Value)
-		h.mu.Unlock()
+		_ = h.sessions.DeleteSession(r.Context(), hashToken(cookie.Value))
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Path: "/", MaxAge: -1, HttpOnly: true, Secure: h.secureCookies, SameSite: http.SameSiteStrictMode})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -268,17 +283,20 @@ func (h *handler) requireSession(next http.Handler) http.Handler {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
-		h.mu.Lock()
-		current, ok := h.sessions[cookie.Value]
-		if ok && !h.now().Before(current.ExpiresAt) {
-			delete(h.sessions, cookie.Value)
+		csrf, expiresAt, ok, err := h.sessions.Session(r.Context(), hashToken(cookie.Value))
+		if err != nil {
+			http.Error(w, "session lookup failed", http.StatusInternalServerError)
+			return
+		}
+		if ok && !h.now().Before(expiresAt) {
+			_ = h.sessions.DeleteSession(r.Context(), hashToken(cookie.Value))
 			ok = false
 		}
-		h.mu.Unlock()
 		if !ok {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
+		current := session{CSRF: csrf, ExpiresAt: expiresAt}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionContextKey{}, current)))
 	})
 }
@@ -305,4 +323,48 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// hashToken returns a hex-encoded SHA-256 of a high-entropy session token, so
+// the raw cookie value is never stored.
+func hashToken(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+// memorySessionStore is a non-durable SessionStore used when no persistent
+// store is configured (tests and single-process fallback).
+type memorySessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]memorySession
+}
+
+type memorySession struct {
+	csrf      string
+	expiresAt time.Time
+}
+
+func newMemorySessionStore() *memorySessionStore {
+	return &memorySessionStore{sessions: make(map[string]memorySession)}
+}
+
+func (m *memorySessionStore) SaveSession(_ context.Context, tokenHash, csrf string, expiresAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessions[tokenHash] = memorySession{csrf: csrf, expiresAt: expiresAt}
+	return nil
+}
+
+func (m *memorySessionStore) Session(_ context.Context, tokenHash string) (string, time.Time, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.sessions[tokenHash]
+	return current.csrf, current.expiresAt, ok, nil
+}
+
+func (m *memorySessionStore) DeleteSession(_ context.Context, tokenHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, tokenHash)
+	return nil
 }

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -84,8 +85,70 @@ func TestOAuthAuthorizationCodeFlow(t *testing.T) {
 	if tokenBody.AccessToken == "" || tokenBody.TokenType != "Bearer" {
 		t.Fatalf("token response = %#v", tokenBody)
 	}
-	if !server.ValidToken(tokenBody.AccessToken) {
+	if !server.ValidToken(context.Background(), tokenBody.AccessToken) {
 		t.Fatal("issued token is not valid")
+	}
+
+	// The authorization code is single use: a replayed exchange must fail.
+	replay := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(tokenForm.Encode()))
+	replay.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	replayResponse := httptest.NewRecorder()
+	mux.ServeHTTP(replayResponse, replay)
+	if replayResponse.Code != http.StatusBadRequest {
+		t.Fatalf("code replay status = %d, want %d", replayResponse.Code, http.StatusBadRequest)
+	}
+}
+
+func TestRegisterAcceptsRefreshTokenGrant(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{Issuer: "https://tasks.example.com", Secret: "secret"})
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	// Claude's connector registers requesting authorization_code AND
+	// refresh_token; the server must register the supported subset, not reject.
+	body := `{"client_name":"Claude","redirect_uris":["https://claude.ai/api/mcp/auth_callback"],` +
+		`"grant_types":["authorization_code","refresh_token"],"response_types":["code"],` +
+		`"token_endpoint_auth_method":"none"}`
+	request := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("register status = %d, want %d; body: %s", response.Code, http.StatusCreated, response.Body.String())
+	}
+	var registration struct {
+		ClientID   string   `json:"client_id"`
+		GrantTypes []string `json:"grant_types"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &registration); err != nil {
+		t.Fatalf("decode registration: %v", err)
+	}
+	if registration.ClientID == "" {
+		t.Fatal("registration returned an empty client_id")
+	}
+	if len(registration.GrantTypes) != 1 || registration.GrantTypes[0] != "authorization_code" {
+		t.Fatalf("registered grant_types = %v, want [authorization_code]", registration.GrantTypes)
+	}
+}
+
+func TestRegisterRejectsMissingAuthorizationCodeGrant(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{Issuer: "https://tasks.example.com", Secret: "secret"})
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	body := `{"client_name":"x","redirect_uris":["https://claude.ai/api/mcp/auth_callback"],` +
+		`"grant_types":["client_credentials"],"token_endpoint_auth_method":"none"}`
+	request := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("register status = %d, want %d", response.Code, http.StatusBadRequest)
 	}
 }
 

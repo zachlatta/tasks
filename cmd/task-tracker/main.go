@@ -140,9 +140,9 @@ func serve(loaded config.Config, service *task.Service, store *postgres.Store, s
 	if err != nil {
 		return err
 	}
-	oauthServer := auth.NewServer(auth.Config{Issuer: loaded.PublicURL, Secret: loaded.Secret})
+	oauthServer := auth.NewServer(auth.Config{Issuer: loaded.PublicURL, Secret: loaded.Secret, Store: store})
 	webHandler := web.New(web.Config{
-		Tasks: service, Reader: store, Objects: objects, Auth: oauthServer, SecureCookies: loaded.SecureCookies(),
+		Tasks: service, Reader: store, Objects: objects, Auth: oauthServer, SecureCookies: loaded.SecureCookies(), Sessions: store,
 	})
 	handler, err := app.NewHTTPHandler(webHandler, oauthServer, mcpserver.New(service, store, version), loaded.PublicURL)
 	if err != nil {
@@ -157,6 +157,22 @@ func serve(loaded config.Config, service *task.Service, store *postgres.Store, s
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweepCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if err := store.DeleteExpiredAuthState(sweepCtx, time.Now()); err != nil {
+					fmt.Fprintf(stderr, "cleanup expired auth state: %v\n", err)
+				}
+				cancel()
+			}
+		}
+	}()
 	serverErrors := make(chan error, 1)
 	go func() {
 		serverErrors <- httpServer.ListenAndServe()
