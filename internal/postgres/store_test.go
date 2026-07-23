@@ -2,15 +2,393 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/zachlatta/tasks/internal/auth"
 	"github.com/zachlatta/tasks/internal/pgtest"
 	"github.com/zachlatta/tasks/internal/task"
 )
+
+func TestServiceMutationsRecordCompleteTaskRevisions(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	service := task.NewService(store, func() time.Time {
+		current := now
+		now = now.Add(time.Minute)
+		return current
+	}, func() string { return "audit-me" })
+
+	created, err := service.Create(ctx, task.CreateInput{Title: "Keep history", Description: "Initial description"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := service.AddAttachment(ctx, created.ID, task.Attachment{
+		Key: "audit-me/evidence.png", Name: "evidence.png", ContentType: "image/png",
+	}); err != nil {
+		t.Fatalf("AddAttachment: %v", err)
+	}
+	if _, err := service.Complete(ctx, created.ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	result, err := store.Query(ctx, `
+		SELECT version, action, before_state, after_state
+		FROM task_revisions
+		WHERE task_id = 'audit-me'
+		ORDER BY version
+	`)
+	if err != nil {
+		t.Fatalf("query revisions: %v", err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("revision count = %d, want 3; rows = %#v", len(result.Rows), result.Rows)
+	}
+	wantActions := []string{"create", "add_attachment", "complete"}
+	for i, want := range wantActions {
+		if got := fmt.Sprint(result.Rows[i]["action"]); got != want {
+			t.Fatalf("revision %d action = %q, want %q", i, got, want)
+		}
+		if got := fmt.Sprint(result.Rows[i]["version"]); got != fmt.Sprint(i+1) {
+			t.Fatalf("revision %d version = %q, want %d", i, got, i+1)
+		}
+	}
+	if result.Rows[0]["before_state"] != nil {
+		t.Fatalf("create before_state = %#v, want nil", result.Rows[0]["before_state"])
+	}
+
+	var createdState task.Task
+	if err := decodeSnapshot(result.Rows[0]["after_state"], &createdState); err != nil {
+		t.Fatalf("decode create snapshot: %v", err)
+	}
+	if createdState.Title != "Keep history" || createdState.Description != "Initial description" || createdState.Status != task.StatusTodo {
+		t.Fatalf("create snapshot = %#v", createdState)
+	}
+	var attachmentState task.Task
+	if err := decodeSnapshot(result.Rows[1]["after_state"], &attachmentState); err != nil {
+		t.Fatalf("decode attachment snapshot: %v", err)
+	}
+	if len(attachmentState.Attachments) != 1 || attachmentState.Attachments[0].Key != "audit-me/evidence.png" {
+		t.Fatalf("attachment snapshot = %#v", attachmentState)
+	}
+	var completedState task.Task
+	if err := decodeSnapshot(result.Rows[2]["after_state"], &completedState); err != nil {
+		t.Fatalf("decode complete snapshot: %v", err)
+	}
+	if completedState.Status != task.StatusDone {
+		t.Fatalf("complete snapshot status = %q, want done", completedState.Status)
+	}
+}
+
+func decodeSnapshot(value any, destination any) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(encoded, destination)
+}
+
+func TestRejectedMutationDoesNotRecordRevision(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	ids := []string{"prerequisite", "blocked"}
+	service := task.NewService(store, func() time.Time { return now }, func() string {
+		id := ids[0]
+		ids = ids[1:]
+		return id
+	})
+	prerequisite, err := service.Create(ctx, task.CreateInput{Title: "Prerequisite"})
+	if err != nil {
+		t.Fatalf("create prerequisite: %v", err)
+	}
+	blocked, err := service.Create(ctx, task.CreateInput{
+		Title: "Blocked", Dependencies: []string{prerequisite.ID},
+	})
+	if err != nil {
+		t.Fatalf("create blocked: %v", err)
+	}
+
+	if _, err := service.Complete(ctx, blocked.ID); !errors.Is(err, task.ErrBlocked) {
+		t.Fatalf("Complete error = %v, want ErrBlocked", err)
+	}
+	result, err := store.Query(ctx, `SELECT action FROM task_revisions WHERE task_id = 'blocked'`)
+	if err != nil {
+		t.Fatalf("query revisions: %v", err)
+	}
+	if len(result.Rows) != 1 || fmt.Sprint(result.Rows[0]["action"]) != "create" {
+		t.Fatalf("blocked revisions = %#v, want only create", result.Rows)
+	}
+}
+
+func TestStoreRollsBackTaskAndRevisionTogether(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	item := task.Task{
+		ID: "atomic", Title: "Before", Status: task.StatusTodo, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.Create(ctx, item); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	item.Title = "After"
+	item.Dependencies = []string{"missing"}
+	item.UpdatedAt = now.Add(time.Minute)
+	item.Version = 2
+	if err := store.Update(ctx, item); err == nil {
+		t.Fatal("Update succeeded with missing dependency")
+	}
+
+	got, err := store.Get(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Title != "Before" || len(got.Dependencies) != 0 {
+		t.Fatalf("task after failed update = %#v", got)
+	}
+	result, err := store.Query(ctx, `SELECT action FROM task_revisions WHERE task_id = 'atomic'`)
+	if err != nil {
+		t.Fatalf("query revisions: %v", err)
+	}
+	if len(result.Rows) != 1 || fmt.Sprint(result.Rows[0]["action"]) != "create" {
+		t.Fatalf("revisions after failed update = %#v, want only create", result.Rows)
+	}
+}
+
+func TestCompletingDoneTaskDoesNotCreateEmptyRevision(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	service := task.NewService(store, func() time.Time {
+		now = now.Add(time.Minute)
+		return now
+	}, func() string { return "once" })
+	created, err := service.Create(ctx, task.CreateInput{Title: "Complete once"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	first, err := service.Complete(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("first Complete: %v", err)
+	}
+	second, err := service.Complete(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("second Complete: %v", err)
+	}
+	if !second.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Fatalf("second completion updated_at = %v, want unchanged %v", second.UpdatedAt, first.UpdatedAt)
+	}
+	result, err := store.Query(ctx, `SELECT action FROM task_revisions WHERE task_id = 'once' ORDER BY version`)
+	if err != nil {
+		t.Fatalf("query revisions: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("revision count = %d, want 2; rows = %#v", len(result.Rows), result.Rows)
+	}
+}
+
+func TestRevisionRecordsAuditAttribution(t *testing.T) {
+	store := newStore(t)
+	ctx := task.WithAuditMetadata(context.Background(), task.AuditMetadata{
+		ActorKind: "oauth_client",
+		ActorID:   "client-123",
+		Source:    "mcp",
+		RequestID: "request-456",
+	})
+	service := task.NewService(store, time.Now, func() string { return "attributed" })
+	if _, err := service.Create(ctx, task.CreateInput{Title: "Attributed"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	result, err := store.Query(context.Background(), `
+		SELECT actor_kind, actor_id, source, request_id
+		FROM task_revisions
+		WHERE task_id = 'attributed'
+	`)
+	if err != nil {
+		t.Fatalf("query revision: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("revision rows = %#v", result.Rows)
+	}
+	row := result.Rows[0]
+	if fmt.Sprint(row["actor_kind"]) != "oauth_client" ||
+		fmt.Sprint(row["actor_id"]) != "client-123" ||
+		fmt.Sprint(row["source"]) != "mcp" ||
+		fmt.Sprint(row["request_id"]) != "request-456" {
+		t.Fatalf("revision attribution = %#v", row)
+	}
+}
+
+func TestOpenBackfillsBaselineRevisionForExistingTask(t *testing.T) {
+	databaseURL := pgtest.URL(t)
+	ctx := context.Background()
+	connection, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect legacy database: %v", err)
+	}
+	_, err = connection.Exec(ctx, `
+		CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT NOT NULL,
+			status TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL
+		);
+		CREATE TABLE dependencies (
+			task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			depends_on_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			PRIMARY KEY (task_id, depends_on_id)
+		);
+		CREATE TABLE images (
+			task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			object_key TEXT NOT NULL,
+			name TEXT NOT NULL,
+			content_type TEXT NOT NULL,
+			PRIMARY KEY (task_id, object_key)
+		);
+		CREATE VIEW task_overview AS
+		SELECT
+			t.*,
+			0 AS blocked,
+			(SELECT count(*) FROM dependencies d WHERE d.task_id = t.id) AS dependency_count,
+			(SELECT count(*) FROM images i WHERE i.task_id = t.id) AS image_count
+		FROM tasks t;
+		INSERT INTO tasks (id, title, description, status, created_at, updated_at)
+		VALUES ('legacy', 'Existing task', 'Predates revisions', 'todo', now(), now());
+	`)
+	connection.Close(ctx)
+	if err != nil {
+		t.Fatalf("seed legacy task: %v", err)
+	}
+
+	store, err := Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	result, err := store.Query(ctx, `
+		SELECT version, action, actor_kind, source, before_state, after_state
+		FROM task_revisions
+		WHERE task_id = 'legacy'
+	`)
+	if err != nil {
+		t.Fatalf("query baseline revision: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("baseline revisions = %#v, want one", result.Rows)
+	}
+	row := result.Rows[0]
+	if fmt.Sprint(row["version"]) != "1" ||
+		fmt.Sprint(row["action"]) != "import" ||
+		fmt.Sprint(row["actor_kind"]) != "system" ||
+		fmt.Sprint(row["source"]) != "migration" ||
+		row["before_state"] != nil {
+		t.Fatalf("baseline revision = %#v", row)
+	}
+	var snapshot task.Task
+	if err := decodeSnapshot(row["after_state"], &snapshot); err != nil {
+		t.Fatalf("decode baseline snapshot: %v", err)
+	}
+	if snapshot.ID != "legacy" || snapshot.Title != "Existing task" || snapshot.Description != "Predates revisions" {
+		t.Fatalf("baseline snapshot = %#v", snapshot)
+	}
+}
+
+func TestTaskRevisionsRejectMutation(t *testing.T) {
+	for name, statement := range map[string]string{
+		"update":   `UPDATE task_revisions SET action = 'tampered'`,
+		"delete":   `DELETE FROM task_revisions`,
+		"truncate": `TRUNCATE task_revisions`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := newStore(t)
+			service := task.NewService(store, time.Now, func() string { return "immutable" })
+			if _, err := service.Create(context.Background(), task.CreateInput{Title: "Immutable"}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if _, err := store.pool.Exec(context.Background(), statement); err == nil {
+				t.Fatalf("%s succeeded, want immutable revision rejection", statement)
+			}
+		})
+	}
+}
+
+func TestStoreRejectsStaleUpdateWithoutRecordingRevision(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	service := task.NewService(store, func() time.Time {
+		now = now.Add(time.Minute)
+		return now
+	}, func() string { return "concurrent" })
+	created, err := service.Create(ctx, task.CreateInput{Title: "Original"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.Version != 1 {
+		t.Fatalf("created version = %d, want 1", created.Version)
+	}
+
+	first, err := store.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Get first: %v", err)
+	}
+	stale := first
+	first.Title = "First writer"
+	first.UpdatedAt = first.UpdatedAt.Add(time.Minute)
+	first.Version++
+	if err := store.Update(ctx, first); err != nil {
+		t.Fatalf("Update first: %v", err)
+	}
+	stale.Title = "Stale writer"
+	stale.UpdatedAt = stale.UpdatedAt.Add(2 * time.Minute)
+	stale.Version++
+	if err := store.Update(ctx, stale); !errors.Is(err, task.ErrConflict) {
+		t.Fatalf("stale Update error = %v, want ErrConflict", err)
+	}
+
+	got, err := store.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Get final: %v", err)
+	}
+	if got.Title != "First writer" || got.Version != 2 {
+		t.Fatalf("task after stale update = %#v", got)
+	}
+	result, err := store.Query(ctx, `SELECT version FROM task_revisions WHERE task_id = 'concurrent' ORDER BY version`)
+	if err != nil {
+		t.Fatalf("query revisions: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("revision count = %d, want 2; rows = %#v", len(result.Rows), result.Rows)
+	}
+}
+
+func TestStoreCreateRejectsNonInitialVersion(t *testing.T) {
+	store := newStore(t)
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	err := store.Create(context.Background(), task.Task{
+		ID: "bad-version", Title: "Bad version", Status: task.StatusTodo,
+		CreatedAt: now, UpdatedAt: now, Version: 7,
+	})
+	if !errors.Is(err, task.ErrInvalid) {
+		t.Fatalf("Create error = %v, want ErrInvalid", err)
+	}
+	result, queryErr := store.Query(context.Background(), `
+		SELECT task_id FROM task_revisions WHERE task_id = 'bad-version'
+	`)
+	if queryErr != nil {
+		t.Fatalf("query revisions: %v", queryErr)
+	}
+	if len(result.Rows) != 0 {
+		t.Fatalf("revisions = %#v, want none", result.Rows)
+	}
+}
 
 func newStore(t *testing.T) *Store {
 	t.Helper()
@@ -158,7 +536,9 @@ func TestStoreUpdateReplacesStatusAndChildren(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create main: %v", err)
 	}
-	updated := task.Task{ID: "main", Title: "Main", Status: task.StatusDone, CreatedAt: now, UpdatedAt: now.Add(time.Hour)}
+	updated := task.Task{
+		ID: "main", Title: "Main", Status: task.StatusDone, CreatedAt: now, UpdatedAt: now.Add(time.Hour), Version: 2,
+	}
 	if err := store.Update(ctx, updated); err != nil {
 		t.Fatalf("update: %v", err)
 	}

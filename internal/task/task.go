@@ -21,6 +21,7 @@ var (
 	ErrAlreadyExists      = errors.New("task already exists")
 	ErrBlocked            = errors.New("task is blocked by incomplete dependencies")
 	ErrDependencyNotFound = errors.New("task dependency not found")
+	ErrConflict           = errors.New("task was changed by another writer")
 	ErrInvalid            = errors.New("invalid task")
 	ErrNotFound           = errors.New("task not found")
 )
@@ -40,6 +41,7 @@ type Task struct {
 	Attachments  []Attachment `json:"attachments,omitempty" yaml:"attachments,omitempty"`
 	CreatedAt    time.Time    `json:"created_at" yaml:"created_at"`
 	UpdatedAt    time.Time    `json:"updated_at" yaml:"updated_at"`
+	Version      int64        `json:"version" yaml:"version"`
 }
 
 type Repository interface {
@@ -53,6 +55,31 @@ type CreateInput struct {
 	Title        string   `json:"title"`
 	Description  string   `json:"description,omitempty"`
 	Dependencies []string `json:"dependencies,omitempty"`
+}
+
+// AuditMetadata describes who initiated a task mutation and through which
+// interface. Service methods add the semantic action before the repository
+// persists the mutation.
+type AuditMetadata struct {
+	Action    string
+	ActorKind string
+	ActorID   string
+	Source    string
+	RequestID string
+}
+
+type auditMetadataContextKey struct{}
+
+// WithAuditMetadata associates mutation attribution with a request context.
+func WithAuditMetadata(ctx context.Context, metadata AuditMetadata) context.Context {
+	return context.WithValue(ctx, auditMetadataContextKey{}, metadata)
+}
+
+// AuditMetadataFromContext returns mutation attribution previously attached to
+// ctx. The zero value means no interface supplied attribution.
+func AuditMetadataFromContext(ctx context.Context) AuditMetadata {
+	metadata, _ := ctx.Value(auditMetadataContextKey{}).(AuditMetadata)
+	return metadata
 }
 
 type Service struct {
@@ -88,11 +115,12 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Task, error) {
 		Dependencies: dependencies,
 		CreatedAt:    now,
 		UpdatedAt:    now,
+		Version:      1,
 	}
 	if created.ID == "" {
 		return Task{}, fmt.Errorf("%w: generated ID is empty", ErrInvalid)
 	}
-	if err := s.repository.Create(ctx, created); err != nil {
+	if err := s.repository.Create(withAuditAction(ctx, "create"), created); err != nil {
 		return Task{}, err
 	}
 	return clone(created), nil
@@ -102,6 +130,9 @@ func (s *Service) Complete(ctx context.Context, id string) (Task, error) {
 	current, err := s.repository.Get(ctx, id)
 	if err != nil {
 		return Task{}, err
+	}
+	if current.Status == StatusDone {
+		return clone(current), nil
 	}
 	for _, dependency := range current.Dependencies {
 		required, err := s.repository.Get(ctx, dependency)
@@ -114,7 +145,8 @@ func (s *Service) Complete(ctx context.Context, id string) (Task, error) {
 	}
 	current.Status = StatusDone
 	current.UpdatedAt = s.now().UTC()
-	if err := s.repository.Update(ctx, current); err != nil {
+	current.Version++
+	if err := s.repository.Update(withAuditAction(ctx, "complete"), current); err != nil {
 		return Task{}, err
 	}
 	return clone(current), nil
@@ -152,7 +184,8 @@ func (s *Service) AddAttachment(ctx context.Context, id string, attachment Attac
 	}
 	current.Attachments = append(current.Attachments, attachment)
 	current.UpdatedAt = s.now().UTC()
-	if err := s.repository.Update(ctx, current); err != nil {
+	current.Version++
+	if err := s.repository.Update(withAuditAction(ctx, "add_attachment"), current); err != nil {
 		return Task{}, err
 	}
 	return clone(current), nil
@@ -167,6 +200,12 @@ func uniqueNonEmpty(values []string) []string {
 		}
 	}
 	return result
+}
+
+func withAuditAction(ctx context.Context, action string) context.Context {
+	metadata := AuditMetadataFromContext(ctx)
+	metadata.Action = action
+	return WithAuditMetadata(ctx, metadata)
 }
 
 func clone(item Task) Task {

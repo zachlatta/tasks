@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOAuthAuthorizationCodeFlow(t *testing.T) {
@@ -509,5 +510,35 @@ func TestBearerMiddlewareAdvertisesProtectedResource(t *testing.T) {
 	want := `resource_metadata="https://tasks.example.com/.well-known/oauth-protected-resource"`
 	if !strings.Contains(response.Header().Get("WWW-Authenticate"), want) {
 		t.Fatalf("WWW-Authenticate = %q, want it to contain %q", response.Header().Get("WWW-Authenticate"), want)
+	}
+}
+
+func TestBearerMiddlewareAddsOAuthClientToContext(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{Issuer: "https://tasks.example.com", Secret: "secret"})
+	const accessToken = "valid-access-token"
+	if err := server.store.SaveToken(context.Background(), hashSecret(accessToken), Token{
+		ClientID:  "client-123",
+		Resource:  "https://tasks.example.com/mcp",
+		Scope:     "tasks",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveToken: %v", err)
+	}
+	handler := server.RequireBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientID, ok := ClientIDFromContext(r.Context())
+		if !ok || clientID != "client-123" {
+			t.Errorf("client identity = %q, %v; want client-123, true", clientID, ok)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusNoContent, response.Body.String())
 	}
 }

@@ -69,6 +69,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	service := task.NewService(store, time.Now, func() string {
 		return strings.ToLower(rand.Text())
 	})
+	mutationContext := task.WithAuditMetadata(context.Background(), task.AuditMetadata{
+		ActorKind: "local_user",
+		Source:    "cli",
+	})
 	switch args[0] {
 	case "add":
 		flags := flag.NewFlagSet("add", flag.ContinueOnError)
@@ -79,7 +83,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		title := strings.Join(flags.Args(), " ")
-		created, err := service.Create(context.Background(), task.CreateInput{
+		created, err := service.Create(mutationContext, task.CreateInput{
 			Title: title, Description: *description, Dependencies: strings.Split(*dependencies, ","),
 		})
 		if err != nil {
@@ -110,7 +114,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "Usage: tasks done <task-id>")
 			return 2
 		}
-		completed, err := service.Complete(context.Background(), args[1])
+		completed, err := service.Complete(mutationContext, args[1])
 		if err != nil {
 			fmt.Fprintf(stderr, "complete task: %v\n", err)
 			return 1

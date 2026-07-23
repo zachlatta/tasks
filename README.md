@@ -6,7 +6,7 @@ A small, self-hosted task manager with one shared Go backend and three interface
 - a secret-protected web UI; and
 - an OAuth-protected MCP server over Streamable HTTP.
 
-Tasks live in PostgreSQL as the single source of truth. Every user-facing read goes through read-only SQL against those tables, while create/complete operations go through the shared task service.
+Tasks live in PostgreSQL as the single source of truth. Every user-facing read goes through read-only SQL against those tables, while create/complete operations go through the shared task service. Every successful mutation also appends an immutable before/after revision in the same database transaction.
 
 ## Quick start
 
@@ -43,6 +43,7 @@ The CLI has no `list` or `show` shortcut. Every user-facing read goes through re
 
 ```sh
 tasks query 'SELECT id, status, blocked, title FROM task_overview ORDER BY created_at DESC'
+tasks query "SELECT version, action, actor_kind, source, occurred_at, before_state, after_state FROM task_revisions WHERE task_id = '<task-id>' ORDER BY version"
 ```
 
 ## MCP
@@ -51,7 +52,7 @@ The MCP endpoint is `https://your-host.example/mcp`. It implements Streamable HT
 
 Available tools:
 
-- `query_tasks_sql`: arbitrary read-only PostgreSQL `SELECT`, `WITH`, or `EXPLAIN` queries, capped at 500 rows;
+- `query_tasks_sql`: arbitrary read-only PostgreSQL `SELECT`, `WITH`, or `EXPLAIN` queries, capped at 500 rows, including task revision history;
 - `create_task`: create a todo, optionally with dependency IDs; and
 - `complete_task`: mark a task done once its dependencies are done.
 
@@ -66,14 +67,32 @@ ORDER BY table_name, ordinal_position;
 
 Each read runs inside a PostgreSQL `READ ONLY` transaction; the CLI and MCP layers also reject statements that do not begin with `SELECT`, `WITH`, or `EXPLAIN`. The intentionally small schema is:
 
-- `tasks(id, title, description, status, created_at, updated_at)`
+- `tasks(id, title, description, status, created_at, updated_at, version)`
 - `dependencies(task_id, depends_on_id)`
 - `images(task_id, object_key, name, content_type)`
-- `task_overview`: all task columns plus `blocked`, `dependency_count`, and `image_count`
+- `task_revisions(revision_id, task_id, version, action, actor_kind, actor_id, source, request_id, occurred_at, before_state, after_state, metadata)`
+- `task_overview`: task columns plus `blocked`, `dependency_count`, and `image_count`
 
 `blocked` is `1` when at least one dependency is not done and `0` otherwise. Agents can discover the schema directly through `information_schema`; there are no non-SQL read tools.
 
-OAuth clients, authorization codes, access tokens, and browser sessions are currently in memory. Restarting the server signs everyone out. This is suitable for a basic single-instance deployment; a durable/distributed token store is the next step before horizontal scaling.
+## Revision history
+
+`task_revisions` is an append-only, Git-like history of successful task changes. Creating, completing, or attaching an image updates the current task and records one revision atomically. A failed or blocked operation records nothing, and repeating completion on an already-done task is a no-op.
+
+Each revision contains:
+
+- a per-task version and semantic action;
+- its interface (`cli`, `web`, `mcp`, or `migration`) and the best actor identity currently available;
+- complete JSONB snapshots before and after the mutation; and
+- a database timestamp, plus reserved request and metadata fields.
+
+The first revision has a null `before_state`. Existing tasks receive a version-one `import` baseline when the upgraded server first opens their database; changes made before that baseline cannot be reconstructed. Revision rows reject update, delete, and truncate operations. Task versions also prevent a stale writer from silently overwriting a newer mutation.
+
+The web UI uses one shared secret, so its revisions identify the web/shared-secret surface rather than an individual person. MCP revisions include the authenticated OAuth client ID. CLI revisions identify the local CLI but do not collect the operating-system username.
+
+Revision snapshots retain old task text and attachment metadata intentionally. They do not copy image bytes; preserving deleted or replaced image content requires object-store versioning or retention.
+
+OAuth clients, authorization codes, access and refresh tokens, and browser sessions are persisted in PostgreSQL. Secret token and session values are stored only as hashes, and authorized clients remain connected across server restarts.
 
 ## Configuration
 
@@ -133,8 +152,9 @@ The release workflows use only the repository-scoped `GITHUB_TOKEN`; no package 
 
 ## Current boundaries
 
-- PostgreSQL is the source of truth, so multiple instances can share task state. Horizontal scaling is still blocked by in-memory OAuth clients, tokens, and browser sessions, which need a durable/distributed store first.
+- PostgreSQL is the source of truth for task and authentication state, so multiple instances can share it. Production instances must also share the configured S3-compatible image store; local image storage is single-instance only.
 - The shared secret grants full task access. There are not yet per-user identities or separate read/write grants.
 - Public deployments should add reverse-proxy request throttling for the login, registration, and authorization endpoints.
 - Attachments are images up to 10 MiB. Local storage is for development; production can use an existing S3-compatible bucket.
+- Task revisions cover successful domain mutations, not reads, failed login attempts, or database-administrator activity. Deployments needing forensic change capture should stream PostgreSQL changes to an external immutable destination in addition to this application history.
 - The project does not yet declare an open-source license.

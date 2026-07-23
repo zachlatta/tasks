@@ -6,6 +6,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -40,8 +41,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 	description TEXT NOT NULL,
 	status TEXT NOT NULL CHECK (status IN ('todo', 'done')),
 	created_at TIMESTAMPTZ NOT NULL,
-	updated_at TIMESTAMPTZ NOT NULL
+	updated_at TIMESTAMPTZ NOT NULL,
+	version BIGINT NOT NULL DEFAULT 1
 );
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
 CREATE TABLE IF NOT EXISTS dependencies (
 	task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
 	depends_on_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -54,11 +57,45 @@ CREATE TABLE IF NOT EXISTS images (
 	content_type TEXT NOT NULL,
 	PRIMARY KEY (task_id, object_key)
 );
+CREATE TABLE IF NOT EXISTS task_revisions (
+	revision_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	task_id TEXT NOT NULL,
+	version BIGINT NOT NULL,
+	action TEXT NOT NULL,
+	actor_kind TEXT NOT NULL,
+	actor_id TEXT,
+	source TEXT NOT NULL,
+	request_id TEXT,
+	occurred_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+	before_state JSONB,
+	after_state JSONB,
+	metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+	UNIQUE (task_id, version)
+);
 CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status);
 CREATE INDEX IF NOT EXISTS dependencies_depends_on_idx ON dependencies(depends_on_id);
+CREATE INDEX IF NOT EXISTS task_revisions_occurred_at_idx ON task_revisions(occurred_at, revision_id);
+CREATE OR REPLACE FUNCTION reject_task_revision_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+	RAISE EXCEPTION 'task revisions are append-only';
+END;
+$$;
+DROP TRIGGER IF EXISTS task_revisions_immutable ON task_revisions;
+CREATE TRIGGER task_revisions_immutable
+	BEFORE UPDATE OR DELETE OR TRUNCATE ON task_revisions
+	FOR EACH STATEMENT
+	EXECUTE FUNCTION reject_task_revision_mutation();
 CREATE OR REPLACE VIEW task_overview AS
 SELECT
-	t.*,
+	t.id,
+	t.title,
+	t.description,
+	t.status,
+	t.created_at,
+	t.updated_at,
 	CASE WHEN EXISTS (
 		SELECT 1
 		FROM dependencies d
@@ -66,7 +103,8 @@ SELECT
 		WHERE d.task_id = t.id AND prerequisite.status <> 'done'
 	) THEN 1 ELSE 0 END AS blocked,
 	(SELECT count(*) FROM dependencies d WHERE d.task_id = t.id) AS dependency_count,
-	(SELECT count(*) FROM images i WHERE i.task_id = t.id) AS image_count
+	(SELECT count(*) FROM images i WHERE i.task_id = t.id) AS image_count,
+	t.version
 FROM tasks t;
 CREATE TABLE IF NOT EXISTS oauth_clients (
 	id TEXT PRIMARY KEY,
@@ -123,6 +161,10 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("initialize task schema: %w", err)
 	}
+	if err := store.backfillTaskRevisions(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("backfill task revisions: %w", err)
+	}
 	return store, nil
 }
 
@@ -140,35 +182,52 @@ func (s *Store) SetMaxRows(maximum int) {
 
 // Create inserts a new task and its dependencies and images atomically.
 func (s *Store) Create(ctx context.Context, item task.Task) error {
+	if item.Version == 0 {
+		item.Version = 1
+	}
+	if item.Version != 1 {
+		return fmt.Errorf("%w: initial task version must be 1", task.ErrInvalid)
+	}
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO tasks (id, title, description, status, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
-		`, item.ID, item.Title, item.Description, string(item.Status), item.CreatedAt, item.UpdatedAt)
+			INSERT INTO tasks (id, title, description, status, created_at, updated_at, version)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`, item.ID, item.Title, item.Description, string(item.Status), item.CreatedAt, item.UpdatedAt, item.Version)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return task.ErrAlreadyExists
 			}
 			return err
 		}
-		return insertChildren(ctx, tx, item)
+		if err := insertChildren(ctx, tx, item); err != nil {
+			return err
+		}
+		return insertTaskRevision(ctx, tx, item.ID, nil, &item, "create")
 	})
 }
 
 // Update overwrites an existing task's mutable fields, dependencies, and images.
-// It reports task.ErrNotFound when the task does not exist.
+// It reports task.ErrNotFound when the task does not exist and task.ErrConflict
+// when item.Version is not exactly one greater than the stored version.
 func (s *Store) Update(ctx context.Context, item task.Task) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
+		before, err := taskForUpdate(ctx, tx, item.ID)
+		if err != nil {
+			return err
+		}
+		if item.Version != before.Version+1 {
+			return task.ErrConflict
+		}
 		tag, err := tx.Exec(ctx, `
 			UPDATE tasks
-			SET title = $2, description = $3, status = $4, updated_at = $5
-			WHERE id = $1
-		`, item.ID, item.Title, item.Description, string(item.Status), item.UpdatedAt)
+			SET title = $2, description = $3, status = $4, updated_at = $5, version = $6
+			WHERE id = $1 AND version = $7
+		`, item.ID, item.Title, item.Description, string(item.Status), item.UpdatedAt, item.Version, before.Version)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			return task.ErrNotFound
+			return task.ErrConflict
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM dependencies WHERE task_id = $1`, item.ID); err != nil {
 			return err
@@ -176,7 +235,10 @@ func (s *Store) Update(ctx context.Context, item task.Task) error {
 		if _, err := tx.Exec(ctx, `DELETE FROM images WHERE task_id = $1`, item.ID); err != nil {
 			return err
 		}
-		return insertChildren(ctx, tx, item)
+		if err := insertChildren(ctx, tx, item); err != nil {
+			return err
+		}
+		return insertTaskRevision(ctx, tx, item.ID, &before, &item, "update")
 	})
 }
 
@@ -186,9 +248,9 @@ func (s *Store) Get(ctx context.Context, id string) (task.Task, error) {
 	var item task.Task
 	var status string
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, title, description, status, created_at, updated_at
+		SELECT id, title, description, status, created_at, updated_at, version
 		FROM tasks WHERE id = $1
-	`, id).Scan(&item.ID, &item.Title, &item.Description, &status, &item.CreatedAt, &item.UpdatedAt)
+	`, id).Scan(&item.ID, &item.Title, &item.Description, &status, &item.CreatedAt, &item.UpdatedAt, &item.Version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task.Task{}, task.ErrNotFound
 	}
@@ -209,7 +271,7 @@ func (s *Store) Get(ctx context.Context, id string) (task.Task, error) {
 // tasks themselves is left to the caller.
 func (s *Store) List(ctx context.Context) ([]task.Task, error) {
 	return s.projection(ctx, `
-		SELECT id, title, description, status, created_at, updated_at FROM tasks
+		SELECT id, title, description, status, created_at, updated_at, version FROM tasks
 	`)
 }
 
@@ -217,7 +279,7 @@ func (s *Store) List(ctx context.Context) ([]task.Task, error) {
 // fixed projection the web UI renders.
 func (s *Store) Tasks(ctx context.Context) ([]task.Task, error) {
 	return s.projection(ctx, `
-		SELECT id, title, description, status, created_at, updated_at
+		SELECT id, title, description, status, created_at, updated_at, version
 		FROM tasks
 		ORDER BY CASE status WHEN 'todo' THEN 0 ELSE 1 END, created_at DESC
 	`)
@@ -234,7 +296,7 @@ func (s *Store) projection(ctx context.Context, taskQuery string) ([]task.Task, 
 	for rows.Next() {
 		var item task.Task
 		var status string
-		if err := rows.Scan(&item.ID, &item.Title, &item.Description, &status, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Title, &item.Description, &status, &item.CreatedAt, &item.UpdatedAt, &item.Version); err != nil {
 			return nil, err
 		}
 		item.Status = task.Status(status)
@@ -369,6 +431,55 @@ func (s *Store) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return tx.Commit(ctx)
 }
 
+func (s *Store) backfillTaskRevisions(ctx context.Context) error {
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT t.id
+			FROM tasks t
+			WHERE NOT EXISTS (
+				SELECT 1 FROM task_revisions r WHERE r.task_id = t.id
+			)
+			ORDER BY t.id
+		`)
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+
+		auditContext := task.WithAuditMetadata(ctx, task.AuditMetadata{
+			Action:    "import",
+			ActorKind: "system",
+			Source:    "migration",
+		})
+		for _, id := range ids {
+			item, err := taskForUpdate(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			if err := insertTaskRevision(auditContext, tx, id, nil, &item, "import"); err != nil {
+				if errors.Is(err, task.ErrConflict) {
+					continue
+				}
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func insertChildren(ctx context.Context, tx pgx.Tx, item task.Task) error {
 	for _, dependency := range item.Dependencies {
 		if _, err := tx.Exec(ctx, `
@@ -385,6 +496,128 @@ func insertChildren(ctx context.Context, tx pgx.Tx, item task.Task) error {
 		}
 	}
 	return nil
+}
+
+func taskForUpdate(ctx context.Context, tx pgx.Tx, id string) (task.Task, error) {
+	var item task.Task
+	var status string
+	err := tx.QueryRow(ctx, `
+		SELECT id, title, description, status, created_at, updated_at, version
+		FROM tasks WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&item.ID, &item.Title, &item.Description, &status, &item.CreatedAt, &item.UpdatedAt, &item.Version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return task.Task{}, task.ErrNotFound
+	}
+	if err != nil {
+		return task.Task{}, err
+	}
+	item.Status = task.Status(status)
+	item.CreatedAt = item.CreatedAt.UTC()
+	item.UpdatedAt = item.UpdatedAt.UTC()
+
+	dependencyRows, err := tx.Query(ctx, `
+		SELECT depends_on_id FROM dependencies
+		WHERE task_id = $1
+		ORDER BY depends_on_id
+	`, id)
+	if err != nil {
+		return task.Task{}, err
+	}
+	for dependencyRows.Next() {
+		var dependencyID string
+		if err := dependencyRows.Scan(&dependencyID); err != nil {
+			dependencyRows.Close()
+			return task.Task{}, err
+		}
+		item.Dependencies = append(item.Dependencies, dependencyID)
+	}
+	if err := dependencyRows.Err(); err != nil {
+		dependencyRows.Close()
+		return task.Task{}, err
+	}
+	dependencyRows.Close()
+
+	imageRows, err := tx.Query(ctx, `
+		SELECT object_key, name, content_type FROM images
+		WHERE task_id = $1
+		ORDER BY object_key
+	`, id)
+	if err != nil {
+		return task.Task{}, err
+	}
+	defer imageRows.Close()
+	for imageRows.Next() {
+		var attachment task.Attachment
+		if err := imageRows.Scan(&attachment.Key, &attachment.Name, &attachment.ContentType); err != nil {
+			return task.Task{}, err
+		}
+		item.Attachments = append(item.Attachments, attachment)
+	}
+	if err := imageRows.Err(); err != nil {
+		return task.Task{}, err
+	}
+	return item, nil
+}
+
+func insertTaskRevision(ctx context.Context, tx pgx.Tx, taskID string, before, after *task.Task, fallbackAction string) error {
+	beforeState, err := marshalTaskSnapshot(before)
+	if err != nil {
+		return err
+	}
+	afterState, err := marshalTaskSnapshot(after)
+	if err != nil {
+		return err
+	}
+	metadata := task.AuditMetadataFromContext(ctx)
+	if metadata.Action == "" {
+		metadata.Action = fallbackAction
+	}
+	if metadata.ActorKind == "" {
+		metadata.ActorKind = "system"
+	}
+	if metadata.Source == "" {
+		metadata.Source = "internal"
+	}
+	var version int64
+	if after != nil && after.Version > 0 {
+		version = after.Version
+	} else {
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(max(version), 0) + 1
+			FROM task_revisions
+			WHERE task_id = $1
+		`, taskID).Scan(&version); err != nil {
+			return err
+		}
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO task_revisions (
+			task_id, version, action, actor_kind, actor_id, source, request_id,
+			before_state, after_state
+		)
+		VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, NULLIF($7, ''), $8, $9)
+		ON CONFLICT (task_id, version) DO NOTHING
+	`, taskID, version, metadata.Action, metadata.ActorKind, metadata.ActorID,
+		metadata.Source, metadata.RequestID, beforeState, afterState)
+	if err != nil {
+		return fmt.Errorf("record task revision for %s: %w", taskID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return task.ErrConflict
+	}
+	return nil
+}
+
+func marshalTaskSnapshot(item *task.Task) (any, error) {
+	if item == nil {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		return nil, fmt.Errorf("encode task revision snapshot: %w", err)
+	}
+	return encoded, nil
 }
 
 func isUniqueViolation(err error) bool {

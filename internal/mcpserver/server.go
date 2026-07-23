@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/zachlatta/tasks/internal/auth"
 	"github.com/zachlatta/tasks/internal/postgres"
 	"github.com/zachlatta/tasks/internal/task"
 )
@@ -43,7 +44,7 @@ func New(tasks *task.Service, reader Reader, version string) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query_tasks_sql",
 		Title:       "Query tasks with read-only SQL",
-		Description: "Runs trusted, read-only PostgreSQL queries. Tables: tasks, dependencies, images. View: task_overview. Results are capped at 500 rows. Inspect the schema via information_schema.columns.",
+		Description: "Runs trusted, read-only PostgreSQL queries. Tables: tasks, dependencies, images, task_revisions. View: task_overview. Results are capped at 500 rows. Inspect the schema via information_schema.columns.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input SQLQueryInput) (*mcp.CallToolResult, SQLQueryOutput, error) {
 		result, err := reader.Query(ctx, input.SQL)
@@ -58,7 +59,7 @@ func New(tasks *task.Service, reader Reader, version string) *mcp.Server {
 		Description: "Creates a todo task in the shared Postgres backend. Dependencies must name existing task IDs.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPointer(false), OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input CreateTaskInput) (*mcp.CallToolResult, task.Task, error) {
-		created, err := tasks.Create(ctx, task.CreateInput{
+		created, err := tasks.Create(mutationContext(ctx), task.CreateInput{
 			Title: input.Title, Description: input.Description, Dependencies: input.Dependencies,
 		})
 		return nil, created, err
@@ -69,10 +70,19 @@ func New(tasks *task.Service, reader Reader, version string) *mcp.Server {
 		Description: "Marks a task done after all of its dependencies are done.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPointer(false), IdempotentHint: true, OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input CompleteTaskInput) (*mcp.CallToolResult, task.Task, error) {
-		completed, err := tasks.Complete(ctx, input.ID)
+		completed, err := tasks.Complete(mutationContext(ctx), input.ID)
 		return nil, completed, err
 	})
 	return server
+}
+
+func mutationContext(ctx context.Context) context.Context {
+	clientID, _ := auth.ClientIDFromContext(ctx)
+	return task.WithAuditMetadata(ctx, task.AuditMetadata{
+		ActorKind: "oauth_client",
+		ActorID:   clientID,
+		Source:    "mcp",
+	})
 }
 
 func boolPointer(value bool) *bool {

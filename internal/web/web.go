@@ -177,7 +177,7 @@ func (h *handler) createTask(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid CSRF token", http.StatusForbidden)
 		return
 	}
-	created, err := h.tasks.Create(r.Context(), task.CreateInput{
+	created, err := h.tasks.Create(webMutationContext(r.Context()), task.CreateInput{
 		Title:        r.PostForm.Get("title"),
 		Description:  r.PostForm.Get("description"),
 		Dependencies: strings.Split(r.PostForm.Get("dependencies"), ","),
@@ -194,7 +194,7 @@ func (h *handler) completeTask(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid CSRF token", http.StatusForbidden)
 		return
 	}
-	if _, err := h.tasks.Complete(r.Context(), r.PathValue("id")); err != nil {
+	if _, err := h.tasks.Complete(webMutationContext(r.Context()), r.PathValue("id")); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, task.ErrBlocked) {
 			status = http.StatusConflict
@@ -255,12 +255,19 @@ func (h *handler) uploadImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store image", http.StatusInternalServerError)
 		return
 	}
-	if _, err := h.tasks.AddAttachment(r.Context(), taskID, task.Attachment{Key: key, Name: name, ContentType: contentType}); err != nil {
+	if _, err := h.tasks.AddAttachment(webMutationContext(r.Context()), taskID, task.Attachment{Key: key, Name: name, ContentType: contentType}); err != nil {
 		_ = h.objects.Delete(r.Context(), key)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	http.Redirect(w, r, "/?message=Image+uploaded", http.StatusSeeOther)
+}
+
+func webMutationContext(ctx context.Context) context.Context {
+	return task.WithAuditMetadata(ctx, task.AuditMetadata{
+		ActorKind: "shared_secret",
+		Source:    "web",
+	})
 }
 
 func (h *handler) image(w http.ResponseWriter, r *http.Request) {

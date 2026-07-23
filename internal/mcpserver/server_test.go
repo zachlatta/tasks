@@ -123,4 +123,21 @@ func TestToolsCreateQueryAndCompleteTasks(t *testing.T) {
 	if err != nil || completed.IsError {
 		t.Fatalf("complete dependent task = %#v, %v", completed, err)
 	}
+	historyResult, err := store.Query(ctx, `
+		SELECT action, actor_kind, source
+		FROM task_revisions
+		WHERE task_id = 'ship-feature'
+		ORDER BY version
+	`)
+	if err != nil {
+		t.Fatalf("query task history: %v", err)
+	}
+	if len(historyResult.Rows) != 2 {
+		t.Fatalf("history rows = %#v, want create and complete", historyResult.Rows)
+	}
+	for _, row := range historyResult.Rows {
+		if row["actor_kind"] != "oauth_client" || row["source"] != "mcp" {
+			t.Fatalf("MCP revision attribution = %#v", row)
+		}
+	}
 }

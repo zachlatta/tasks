@@ -42,6 +42,21 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 	if !strings.Contains(output.String(), `"status": "done"`) {
 		t.Fatalf("status query output = %q", output.String())
 	}
+
+	output.Reset()
+	if code := run([]string{
+		"query",
+		"SELECT action, actor_kind, source FROM task_revisions WHERE task_id = '" + id + "' ORDER BY version",
+	}, &output, &errors); code != 0 {
+		t.Fatalf("history query exit = %d; stderr: %s", code, errors.String())
+	}
+	history := output.String()
+	if !strings.Contains(history, `"action": "create"`) ||
+		!strings.Contains(history, `"action": "complete"`) ||
+		!strings.Contains(history, `"actor_kind": "local_user"`) ||
+		!strings.Contains(history, `"source": "cli"`) {
+		t.Fatalf("history query output = %q", history)
+	}
 }
 
 func TestCLIHasNoListCommand(t *testing.T) {

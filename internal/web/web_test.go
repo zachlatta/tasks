@@ -118,6 +118,79 @@ func TestCreateCompleteAndUploadImage(t *testing.T) {
 	}
 }
 
+func TestTaskMutationsCarryWebAuditAttribution(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	repository := &auditCapturingRepository{Repository: tasktest.NewRepository()}
+	service := task.NewService(repository, time.Now, func() string { return "web-audit" })
+	handler := New(Config{
+		Tasks:   service,
+		Reader:  repository,
+		Objects: objectstore.NewLocal(filepath.Join(root, "objects")),
+		Auth:    auth.NewServer(auth.Config{Issuer: "http://tasks.example.com", Secret: "shared-secret"}),
+	})
+	cookie, csrf := login(t, handler)
+	create := postForm(handler, "/tasks", url.Values{
+		"csrf": {csrf}, "title": {"Web audit"},
+	}, cookie)
+	if create.Code != http.StatusSeeOther {
+		t.Fatalf("create status = %d; body: %s", create.Code, create.Body.String())
+	}
+	var uploadBody bytes.Buffer
+	writer := multipart.NewWriter(&uploadBody)
+	if err := writer.WriteField("csrf", csrf); err != nil {
+		t.Fatalf("write csrf: %v", err)
+	}
+	file, err := writer.CreateFormFile("image", "audit.png")
+	if err != nil {
+		t.Fatalf("create image form part: %v", err)
+	}
+	if _, err := file.Write([]byte("\x89PNG\r\n\x1a\nimage")); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	uploadRequest := httptest.NewRequest(http.MethodPost, "/tasks/web-audit/images", &uploadBody)
+	uploadRequest.Header.Set("Content-Type", writer.FormDataContentType())
+	uploadRequest.AddCookie(cookie)
+	uploadResponse := httptest.NewRecorder()
+	handler.ServeHTTP(uploadResponse, uploadRequest)
+	if uploadResponse.Code != http.StatusSeeOther {
+		t.Fatalf("upload status = %d; body: %s", uploadResponse.Code, uploadResponse.Body.String())
+	}
+	complete := postForm(handler, "/tasks/web-audit/done", url.Values{"csrf": {csrf}}, cookie)
+	if complete.Code != http.StatusSeeOther {
+		t.Fatalf("complete status = %d; body: %s", complete.Code, complete.Body.String())
+	}
+
+	if len(repository.mutations) != 3 {
+		t.Fatalf("captured mutations = %#v", repository.mutations)
+	}
+	wantActions := []string{"create", "add_attachment", "complete"}
+	for index, mutation := range repository.mutations {
+		if mutation.Action != wantActions[index] || mutation.ActorKind != "shared_secret" || mutation.Source != "web" {
+			t.Fatalf("mutation %d attribution = %#v", index, mutation)
+		}
+	}
+}
+
+type auditCapturingRepository struct {
+	*tasktest.Repository
+	mutations []task.AuditMetadata
+}
+
+func (r *auditCapturingRepository) Create(ctx context.Context, item task.Task) error {
+	r.mutations = append(r.mutations, task.AuditMetadataFromContext(ctx))
+	return r.Repository.Create(ctx, item)
+}
+
+func (r *auditCapturingRepository) Update(ctx context.Context, item task.Task) error {
+	r.mutations = append(r.mutations, task.AuditMetadataFromContext(ctx))
+	return r.Repository.Update(ctx, item)
+}
+
 func testHandler(t *testing.T) (http.Handler, *task.Service) {
 	t.Helper()
 	root := t.TempDir()

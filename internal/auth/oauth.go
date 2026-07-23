@@ -94,6 +94,8 @@ type Server struct {
 	store      Store
 }
 
+type clientIDContextKey struct{}
+
 func NewServer(config Config) *Server {
 	issuer := strings.TrimRight(config.Issuer, "/")
 	if config.CodeTTL <= 0 {
@@ -138,27 +140,48 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 func (s *Server) RequireBearer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Fields(r.Header.Get("Authorization"))
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || !s.ValidToken(r.Context(), parts[1]) {
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata=%q, scope=%q`, s.issuer+"/.well-known/oauth-protected-resource", taskScope))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		token, ok := s.validToken(r.Context(), parts[1])
+		if !ok {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata=%q, scope=%q`, s.issuer+"/.well-known/oauth-protected-resource", taskScope))
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), clientIDContextKey{}, token.ClientID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 func (s *Server) ValidToken(ctx context.Context, value string) bool {
+	_, ok := s.validToken(ctx, value)
+	return ok
+}
+
+func (s *Server) validToken(ctx context.Context, value string) (Token, bool) {
 	if value == "" {
-		return false
+		return Token{}, false
 	}
 	token, ok, err := s.store.Token(ctx, hashSecret(value))
 	if err != nil || !ok {
-		return false
+		return Token{}, false
 	}
 	if !s.now().Before(token.ExpiresAt) {
-		return false
+		return Token{}, false
 	}
-	return token.Resource == s.resource
+	if token.Resource != s.resource {
+		return Token{}, false
+	}
+	return token, true
+}
+
+// ClientIDFromContext returns the OAuth client authenticated by RequireBearer.
+func ClientIDFromContext(ctx context.Context) (string, bool) {
+	clientID, ok := ctx.Value(clientIDContextKey{}).(string)
+	return clientID, ok && clientID != ""
 }
 
 func (s *Server) CheckSecret(value string) bool {
