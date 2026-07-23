@@ -151,6 +151,68 @@ func TestTaskPageShowsOnlyRequestedTask(t *testing.T) {
 	}
 }
 
+func TestIndexRendersTasksAsKanbanBoard(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	repository := tasktest.NewRepository()
+	now := time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC)
+	for _, item := range []task.Task{
+		{ID: "plan-launch", Title: "Plan the launch", Status: task.StatusTodo, CreatedAt: now, UpdatedAt: now, Version: 1},
+		{ID: "build-launch", Title: "Build the launch", Status: task.StatusInProgress, CreatedAt: now.Add(-time.Hour), UpdatedAt: now, Version: 2},
+		{ID: "write-brief", Title: "Write the brief", Status: task.StatusDone, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now, Version: 2},
+	} {
+		if err := repository.Create(context.Background(), item); err != nil {
+			t.Fatalf("seed task %q: %v", item.ID, err)
+		}
+	}
+	service := task.NewService(repository, time.Now, func() string { return "new-task" })
+	handler := New(Config{
+		Tasks:   service,
+		Reader:  repository,
+		Objects: objectstore.NewLocal(filepath.Join(root, "objects")),
+		Auth:    auth.NewServer(auth.Config{Issuer: "http://tasks.example.com", Secret: "shared-secret"}),
+	})
+	cookie, _ := login(t, handler)
+
+	page := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.AddCookie(cookie)
+	handler.ServeHTTP(page, request)
+	if page.Code != http.StatusOK {
+		t.Fatalf("index status = %d; body: %s", page.Code, page.Body.String())
+	}
+
+	body := page.Body.String()
+	if !strings.Contains(body, `class="kanban-board"`) {
+		t.Fatalf("index does not render a kanban board; body: %s", body)
+	}
+	todoColumn := findKanbanColumn(t, body, task.StatusTodo)
+	inProgressColumn := findKanbanColumn(t, body, task.StatusInProgress)
+	doneColumn := findKanbanColumn(t, body, task.StatusDone)
+	if !strings.Contains(todoColumn, "To do") || !strings.Contains(todoColumn, `class="column-count">1</span>`) {
+		t.Fatalf("todo column heading or count is missing: %s", todoColumn)
+	}
+	if !strings.Contains(inProgressColumn, "In progress") || !strings.Contains(inProgressColumn, `class="column-count">1</span>`) {
+		t.Fatalf("in-progress column heading or count is missing: %s", inProgressColumn)
+	}
+	if !strings.Contains(doneColumn, "Done") || !strings.Contains(doneColumn, `class="column-count">1</span>`) {
+		t.Fatalf("done column heading or count is missing: %s", doneColumn)
+	}
+	if !strings.Contains(todoColumn, "Plan the launch") || strings.Contains(todoColumn, "Build the launch") || strings.Contains(todoColumn, "Write the brief") {
+		t.Fatalf("todo column contains the wrong tasks: %s", todoColumn)
+	}
+	if !strings.Contains(inProgressColumn, "Build the launch") || strings.Contains(inProgressColumn, "Plan the launch") || strings.Contains(inProgressColumn, "Write the brief") {
+		t.Fatalf("in-progress column contains the wrong tasks: %s", inProgressColumn)
+	}
+	if !strings.Contains(doneColumn, "Write the brief") || strings.Contains(doneColumn, "Plan the launch") || strings.Contains(doneColumn, "Build the launch") {
+		t.Fatalf("done column contains the wrong tasks: %s", doneColumn)
+	}
+	if !strings.Contains(todoColumn, `/tasks/plan-launch/start`) || !strings.Contains(inProgressColumn, `/tasks/build-launch/done`) || strings.Contains(doneColumn, `/tasks/write-brief/`) {
+		t.Fatalf("workflow controls do not match task state; todo: %s; in progress: %s; done: %s", todoColumn, inProgressColumn, doneColumn)
+	}
+}
+
 func TestCreateCompleteAndUploadImage(t *testing.T) {
 	t.Parallel()
 
@@ -170,6 +232,15 @@ func TestCreateCompleteAndUploadImage(t *testing.T) {
 		t.Fatalf("List = %#v, %v", items, err)
 	}
 	created := items[0]
+
+	start := postForm(handler, "/tasks/"+created.ID+"/start", url.Values{"csrf": {csrf}}, cookie)
+	if start.Code != http.StatusSeeOther {
+		t.Fatalf("start status = %d; body: %s", start.Code, start.Body.String())
+	}
+	started, err := service.Get(context.Background(), created.ID)
+	if err != nil || started.Status != task.StatusInProgress {
+		t.Fatalf("started task = %#v, %v", started, err)
+	}
 
 	var uploadBody bytes.Buffer
 	writer := multipart.NewWriter(&uploadBody)
@@ -226,6 +297,10 @@ func TestTaskMutationsCarryWebAuditAttribution(t *testing.T) {
 	if create.Code != http.StatusSeeOther {
 		t.Fatalf("create status = %d; body: %s", create.Code, create.Body.String())
 	}
+	start := postForm(handler, "/tasks/web-audit/start", url.Values{"csrf": {csrf}}, cookie)
+	if start.Code != http.StatusSeeOther {
+		t.Fatalf("start status = %d; body: %s", start.Code, start.Body.String())
+	}
 	var uploadBody bytes.Buffer
 	writer := multipart.NewWriter(&uploadBody)
 	if err := writer.WriteField("csrf", csrf); err != nil {
@@ -254,10 +329,10 @@ func TestTaskMutationsCarryWebAuditAttribution(t *testing.T) {
 		t.Fatalf("complete status = %d; body: %s", complete.Code, complete.Body.String())
 	}
 
-	if len(repository.mutations) != 3 {
+	if len(repository.mutations) != 4 {
 		t.Fatalf("captured mutations = %#v", repository.mutations)
 	}
-	wantActions := []string{"create", "add_attachment", "complete"}
+	wantActions := []string{"create", "start", "add_attachment", "complete"}
 	for index, mutation := range repository.mutations {
 		if mutation.Action != wantActions[index] || mutation.ActorKind != "shared_secret" || mutation.Source != "web" {
 			t.Fatalf("mutation %d attribution = %#v", index, mutation)
@@ -337,4 +412,14 @@ func postForm(handler http.Handler, target string, values url.Values, cookie *ht
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
+}
+
+func findKanbanColumn(t *testing.T, body string, status task.Status) string {
+	t.Helper()
+	pattern := `(?s)<section class="kanban-column" data-status="` + regexp.QuoteMeta(string(status)) + `".*?</section>`
+	column := regexp.MustCompile(pattern).FindString(body)
+	if column == "" {
+		t.Fatalf("kanban column %q not found in body: %s", status, body)
+	}
+	return column
 }

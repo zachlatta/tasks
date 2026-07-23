@@ -13,8 +13,9 @@ import (
 type Status string
 
 const (
-	StatusTodo Status = "todo"
-	StatusDone Status = "done"
+	StatusTodo       Status = "todo"
+	StatusInProgress Status = "in_progress"
+	StatusDone       Status = "done"
 )
 
 var (
@@ -152,6 +153,26 @@ func (s *Service) Complete(ctx context.Context, id string) (Task, error) {
 	return clone(current), nil
 }
 
+func (s *Service) Start(ctx context.Context, id string) (Task, error) {
+	current, err := s.repository.Get(ctx, id)
+	if err != nil {
+		return Task{}, err
+	}
+	if current.Status == StatusInProgress {
+		return clone(current), nil
+	}
+	if current.Status != StatusTodo {
+		return Task{}, fmt.Errorf("%w: only todo tasks can be started", ErrInvalid)
+	}
+	current.Status = StatusInProgress
+	current.UpdatedAt = s.now().UTC()
+	current.Version++
+	if err := s.repository.Update(withAuditAction(ctx, "start"), current); err != nil {
+		return Task{}, err
+	}
+	return clone(current), nil
+}
+
 func (s *Service) Get(ctx context.Context, id string) (Task, error) {
 	item, err := s.repository.Get(ctx, id)
 	return clone(item), err
@@ -164,7 +185,7 @@ func (s *Service) List(ctx context.Context) ([]Task, error) {
 	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].Status != items[j].Status {
-			return items[i].Status == StatusTodo
+			return statusOrder(items[i].Status) < statusOrder(items[j].Status)
 		}
 		return items[i].CreatedAt.After(items[j].CreatedAt)
 	})
@@ -172,6 +193,19 @@ func (s *Service) List(ctx context.Context) ([]Task, error) {
 		items[i] = clone(items[i])
 	}
 	return items, nil
+}
+
+func statusOrder(status Status) int {
+	switch status {
+	case StatusTodo:
+		return 0
+	case StatusInProgress:
+		return 1
+	case StatusDone:
+		return 2
+	default:
+		return 3
+	}
 }
 
 func (s *Service) AddAttachment(ctx context.Context, id string, attachment Attachment) (Task, error) {

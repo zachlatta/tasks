@@ -7,91 +7,113 @@
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<header>
-  <div>
-    <p class="eyebrow">POSTGRES-BACKED</p>
-    <h1>Tasks</h1>
-  </div>
-  <form method="post" action="/logout">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <button class="quiet" type="submit">Sign out</button>
-  </form>
-</header>
-<main>
-  {{with .Message}}<p class="notice">{{.}}</p>{{end}}
-
-  {{if not .SingleTask}}
-  <section class="new-task">
-    <h2>Add a task</h2>
-    <form method="post" action="/tasks">
+  <header>
+    <div>
+      <p class="eyebrow">POSTGRES-BACKED</p>
+      <h1>Tasks</h1>
+    </div>
+    <form method="post" action="/logout">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <label>Title<input name="title" required></label>
-      <label>Description<textarea name="description" rows="3"></textarea></label>
-      <label>Dependencies <span>(comma-separated IDs)</span><input name="dependencies"></label>
-      <button type="submit">Create task</button>
+      <button class="quiet" type="submit">Sign out</button>
     </form>
-  </section>
-  {{end}}
+  </header>
+  <main>
+    {{with .Message}}<p class="notice" role="status">{{.}}</p>{{end}}
 
-  <section>
-    <div class="section-heading">
-      {{if .SingleTask}}
-      <h2>Task</h2>
-      <a class="back-link" href="/">All tasks</a>
-      {{else}}
-      <h2>Tasks</h2>
-      <span>{{len .Tasks}} total</span>
-      {{end}}
-    </div>
-    <div class="task-list">
-      {{range .Tasks}}
-      <article class="task {{.Status}}">
-        <div class="task-heading">
-          <div>
-            <span class="status">{{.Status}}</span>
-            <h3><a class="task-link" href="/{{.ID}}">{{.Title}}</a></h3>
-            <code>{{.ID}}</code>
+    {{if .SingleTask}}
+    <section class="detail-section" aria-labelledby="detail-heading">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">TASK</p>
+          <h2 id="detail-heading">Task details</h2>
+        </div>
+        <a class="back-link" href="/">All tasks</a>
+      </div>
+      <div class="task-detail">{{template "task-card" .DetailTask}}</div>
+    </section>
+    {{else}}
+    <section class="new-task" aria-labelledby="new-task-heading">
+      <div class="new-task-heading">
+        <div>
+          <p class="eyebrow">QUICK ADD</p>
+          <h2 id="new-task-heading">Create a task</h2>
+        </div>
+        <p>Capture the work now, then move it across the board.</p>
+      </div>
+      <form class="new-task-form" method="post" action="/tasks">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <label for="task-title">Title<input id="task-title" name="title" required></label>
+        <label for="task-dependencies">Dependencies <span>(comma-separated IDs)</span><input id="task-dependencies" name="dependencies"></label>
+        <label class="description-field" for="task-description">Description<textarea id="task-description" name="description" rows="2"></textarea></label>
+        <button type="submit">Create task</button>
+      </form>
+    </section>
+
+    <section class="board-section" aria-labelledby="board-heading">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">WORKFLOW</p>
+          <h2 id="board-heading">Task board</h2>
+        </div>
+        <span>{{.TaskCount}} total</span>
+      </div>
+      <div class="kanban-board">
+        <section class="kanban-column" data-status="todo" aria-labelledby="todo-heading">
+          <header class="column-heading">
+            <h2 id="todo-heading"><span class="status-dot" aria-hidden="true"></span>To do</h2>
+            <span class="column-count">{{len .TodoTasks}}</span>
+          </header>
+          <div class="column-task-list">
+            {{range .TodoTasks}}{{template "task-card" .}}{{else}}<p class="column-empty">No tasks waiting.</p>{{end}}
           </div>
-          {{if eq .Status "todo"}}
-          <form method="post" action="/tasks/{{.ID}}/done">
-            <input type="hidden" name="csrf" value="{{$.CSRF}}">
-            <button type="submit">Mark done</button>
-          </form>
-          {{end}}
-        </div>
+        </section>
 
-        {{with .Description}}<div class="description">{{renderMarkdown .}}</div>{{end}}
-        {{with .Dependencies}}
-        <p>
-          <strong>Depends on:</strong>
-          {{range $index, $item := .}}{{if $index}}, {{end}}<a href="/{{$item}}"><code>{{$item}}</code></a>{{end}}
-        </p>
-        {{end}}
+        <section class="kanban-column" data-status="in_progress" aria-labelledby="in-progress-heading">
+          <header class="column-heading">
+            <h2 id="in-progress-heading"><span class="status-dot" aria-hidden="true"></span>In progress</h2>
+            <span class="column-count">{{len .InProgressTasks}}</span>
+          </header>
+          <div class="column-task-list">
+            {{range .InProgressTasks}}{{template "task-card" .}}{{else}}<p class="column-empty">Nothing in motion.</p>{{end}}
+          </div>
+        </section>
 
-        {{with .Attachments}}
-        <div class="images">
-          {{range .}}
-          <figure>
-            <img src="/images/{{.Key}}" alt="{{.Name}}">
-            <figcaption>{{.Name}}</figcaption>
-          </figure>
-          {{end}}
-        </div>
-        {{end}}
-
-        {{if eq .Status "todo"}}
-        <form class="upload" method="post" enctype="multipart/form-data" action="/tasks/{{.ID}}/images">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <label>Attach image<input type="file" name="image" accept="image/*" required></label>
-          <button class="quiet" type="submit">Upload</button>
-        </form>
-        {{end}}
-      </article>
-      {{else}}
-      <p class="empty">No tasks yet. Add the first one above.</p>
-      {{end}}
-    </div>
-  </section>
-</main>
+        <section class="kanban-column" data-status="done" aria-labelledby="done-heading">
+          <header class="column-heading">
+            <h2 id="done-heading"><span class="status-dot" aria-hidden="true"></span>Done</h2>
+            <span class="column-count">{{len .DoneTasks}}</span>
+          </header>
+          <div class="column-task-list">
+            {{range .DoneTasks}}{{template "task-card" .}}{{else}}<p class="column-empty">Completed tasks land here.</p>{{end}}
+          </div>
+        </section>
+      </div>
+    </section>
+    {{end}}
+  </main>
 </body>
 </html>{{end}}
+
+{{define "task-card"}}<article class="task {{.Status}}">
+  <div class="task-heading">
+    <div class="task-title">
+      <h3><a class="task-link" href="/{{.ID}}">{{.Title}}</a></h3>
+      <code class="task-id">{{.ID}}</code>
+    </div>
+    {{if .Action}}<form method="post" action="{{.Action}}">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button class="small" type="submit">{{.ActionLabel}}</button>
+    </form>{{end}}
+  </div>
+  {{with .Description}}<div class="description">{{renderMarkdown .}}</div>{{end}}
+  {{with .Dependencies}}<p class="dependencies"><strong>Depends on</strong>{{range .}}<a href="/{{.}}"><code>{{.}}</code></a>{{end}}</p>{{end}}
+  {{with .Attachments}}<div class="images">{{range .}}<figure><img src="/images/{{.Key}}" alt="{{.Name}}"><figcaption>{{.Name}}</figcaption></figure>{{end}}</div>{{end}}
+  {{if ne .Status "done"}}<details class="attachment-panel">
+    <summary>Attach an image</summary>
+    <form class="upload" method="post" enctype="multipart/form-data" action="/tasks/{{.ID}}/images">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <label>Image<input type="file" name="image" accept="image/*" required></label>
+      <button class="quiet small" type="submit">Upload</button>
+    </form>
+  </details>{{end}}
+</article>{{end}}

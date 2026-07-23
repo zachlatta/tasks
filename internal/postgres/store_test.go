@@ -28,6 +28,9 @@ func TestServiceMutationsRecordCompleteTaskRevisions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	if _, err := service.Start(ctx, created.ID); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	if _, err := service.AddAttachment(ctx, created.ID, task.Attachment{
 		Key: "audit-me/evidence.png", Name: "evidence.png", ContentType: "image/png",
 	}); err != nil {
@@ -46,10 +49,10 @@ func TestServiceMutationsRecordCompleteTaskRevisions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query revisions: %v", err)
 	}
-	if len(result.Rows) != 3 {
-		t.Fatalf("revision count = %d, want 3; rows = %#v", len(result.Rows), result.Rows)
+	if len(result.Rows) != 4 {
+		t.Fatalf("revision count = %d, want 4; rows = %#v", len(result.Rows), result.Rows)
 	}
-	wantActions := []string{"create", "add_attachment", "complete"}
+	wantActions := []string{"create", "start", "add_attachment", "complete"}
 	for i, want := range wantActions {
 		if got := fmt.Sprint(result.Rows[i]["action"]); got != want {
 			t.Fatalf("revision %d action = %q, want %q", i, got, want)
@@ -69,15 +72,22 @@ func TestServiceMutationsRecordCompleteTaskRevisions(t *testing.T) {
 	if createdState.Title != "Keep history" || createdState.Description != "Initial description" || createdState.Status != task.StatusTodo {
 		t.Fatalf("create snapshot = %#v", createdState)
 	}
+	var startedState task.Task
+	if err := decodeSnapshot(result.Rows[1]["after_state"], &startedState); err != nil {
+		t.Fatalf("decode start snapshot: %v", err)
+	}
+	if startedState.Status != task.StatusInProgress {
+		t.Fatalf("start snapshot status = %q, want in progress", startedState.Status)
+	}
 	var attachmentState task.Task
-	if err := decodeSnapshot(result.Rows[1]["after_state"], &attachmentState); err != nil {
+	if err := decodeSnapshot(result.Rows[2]["after_state"], &attachmentState); err != nil {
 		t.Fatalf("decode attachment snapshot: %v", err)
 	}
 	if len(attachmentState.Attachments) != 1 || attachmentState.Attachments[0].Key != "audit-me/evidence.png" {
 		t.Fatalf("attachment snapshot = %#v", attachmentState)
 	}
 	var completedState task.Task
-	if err := decodeSnapshot(result.Rows[2]["after_state"], &completedState); err != nil {
+	if err := decodeSnapshot(result.Rows[3]["after_state"], &completedState); err != nil {
 		t.Fatalf("decode complete snapshot: %v", err)
 	}
 	if completedState.Status != task.StatusDone {
@@ -236,7 +246,7 @@ func TestOpenBackfillsBaselineRevisionForExistingTask(t *testing.T) {
 			id TEXT PRIMARY KEY,
 			title TEXT NOT NULL,
 			description TEXT NOT NULL,
-			status TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('todo', 'done')),
 			created_at TIMESTAMPTZ NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL
 		);
@@ -297,6 +307,14 @@ func TestOpenBackfillsBaselineRevisionForExistingTask(t *testing.T) {
 	}
 	if snapshot.ID != "legacy" || snapshot.Title != "Existing task" || snapshot.Description != "Predates revisions" {
 		t.Fatalf("baseline snapshot = %#v", snapshot)
+	}
+	service := task.NewService(store, time.Now, func() string { return "unused" })
+	started, err := service.Start(ctx, "legacy")
+	if err != nil {
+		t.Fatalf("start legacy task after status-constraint migration: %v", err)
+	}
+	if started.Status != task.StatusInProgress {
+		t.Fatalf("legacy task status = %q, want in progress", started.Status)
 	}
 }
 
@@ -554,20 +572,21 @@ func TestStoreUpdateReplacesStatusAndChildren(t *testing.T) {
 	}
 }
 
-func TestTasksOrdersTodoFirstThenNewest(t *testing.T) {
+func TestTasksOrdersByWorkflowStateThenNewest(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()
 	base := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
 	mustCreate(t, store, task.Task{ID: "old-todo", Title: "Old todo", Status: task.StatusTodo, CreatedAt: base, UpdatedAt: base})
 	mustCreate(t, store, task.Task{ID: "new-todo", Title: "New todo", Status: task.StatusTodo, CreatedAt: base.Add(time.Hour), UpdatedAt: base.Add(time.Hour)})
+	mustCreate(t, store, task.Task{ID: "active-task", Title: "Active", Status: task.StatusInProgress, CreatedAt: base.Add(3 * time.Hour), UpdatedAt: base.Add(3 * time.Hour)})
 	mustCreate(t, store, task.Task{ID: "done-task", Title: "Done", Status: task.StatusDone, CreatedAt: base.Add(2 * time.Hour), UpdatedAt: base.Add(2 * time.Hour)})
 
 	items, err := store.Tasks(ctx)
 	if err != nil {
 		t.Fatalf("Tasks: %v", err)
 	}
-	order := []string{items[0].ID, items[1].ID, items[2].ID}
-	want := []string{"new-todo", "old-todo", "done-task"}
+	order := []string{items[0].ID, items[1].ID, items[2].ID, items[3].ID}
+	want := []string{"new-todo", "old-todo", "active-task", "done-task"}
 	for i := range want {
 		if order[i] != want[i] {
 			t.Fatalf("Tasks order = %v, want %v", order, want)

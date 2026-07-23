@@ -63,8 +63,8 @@ func (r *Repository) List(_ context.Context) ([]task.Task, error) {
 	return items, nil
 }
 
-// Tasks returns every task ordered todo-first then newest-first, mirroring the
-// fixed projection the web UI reads through in production.
+// Tasks returns every task ordered by workflow state then newest-first,
+// mirroring the fixed projection the web UI reads through in production.
 func (r *Repository) Tasks(ctx context.Context) ([]task.Task, error) {
 	items, err := r.List(ctx)
 	if err != nil {
@@ -72,11 +72,24 @@ func (r *Repository) Tasks(ctx context.Context) ([]task.Task, error) {
 	}
 	sort.SliceStable(items, func(i, j int) bool {
 		if items[i].Status != items[j].Status {
-			return items[i].Status == task.StatusTodo
+			return statusOrder(items[i].Status) < statusOrder(items[j].Status)
 		}
 		return items[i].CreatedAt.After(items[j].CreatedAt)
 	})
 	return items, nil
+}
+
+func statusOrder(status task.Status) int {
+	switch status {
+	case task.StatusTodo:
+		return 0
+	case task.StatusInProgress:
+		return 1
+	case task.StatusDone:
+		return 2
+	default:
+		return 3
+	}
 }
 
 func clone(item task.Task) task.Task {

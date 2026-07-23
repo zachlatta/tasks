@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 )
@@ -43,6 +44,69 @@ func TestCreateAndCompleteTaskWithDependencies(t *testing.T) {
 	}
 	if completed.Status != StatusDone {
 		t.Fatalf("status = %q, want %q", completed.Status, StatusDone)
+	}
+}
+
+func TestStartTaskMovesItIntoProgress(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, func() time.Time { return now }, func() string { return "build-board" })
+	created, err := service.Create(context.Background(), CreateInput{Title: "Build the board"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	now = now.Add(time.Hour)
+	started, err := service.Start(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if started.Status != StatusInProgress {
+		t.Fatalf("status = %q, want %q", started.Status, StatusInProgress)
+	}
+	if started.Version != 2 || !started.UpdatedAt.Equal(now) {
+		t.Fatalf("started task version/time = %d/%v, want 2/%v", started.Version, started.UpdatedAt, now)
+	}
+
+	startedAgain, err := service.Start(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Start again: %v", err)
+	}
+	if startedAgain.Version != started.Version {
+		t.Fatalf("repeated Start version = %d, want unchanged %d", startedAgain.Version, started.Version)
+	}
+}
+
+func TestListOrdersTasksByWorkflowStateThenNewest(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	base := time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC)
+	for _, item := range []Task{
+		{ID: "done", Title: "Done", Status: StatusDone, CreatedAt: base.Add(4 * time.Hour)},
+		{ID: "active", Title: "Active", Status: StatusInProgress, CreatedAt: base.Add(3 * time.Hour)},
+		{ID: "older-todo", Title: "Older todo", Status: StatusTodo, CreatedAt: base},
+		{ID: "newer-todo", Title: "Newer todo", Status: StatusTodo, CreatedAt: base.Add(time.Hour)},
+	} {
+		if err := repo.Create(context.Background(), item); err != nil {
+			t.Fatalf("seed task %q: %v", item.ID, err)
+		}
+	}
+	service := NewService(repo, time.Now, func() string { return "unused" })
+
+	items, err := service.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	got := make([]string, len(items))
+	for index, item := range items {
+		got[index] = item.ID
+	}
+	want := []string{"newer-todo", "older-todo", "active", "done"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("task order = %v, want %v", got, want)
 	}
 }
 

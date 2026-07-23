@@ -39,12 +39,26 @@ CREATE TABLE IF NOT EXISTS tasks (
 	id TEXT PRIMARY KEY,
 	title TEXT NOT NULL,
 	description TEXT NOT NULL,
-	status TEXT NOT NULL CHECK (status IN ('todo', 'done')),
+	status TEXT NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL,
 	updated_at TIMESTAMPTZ NOT NULL,
 	version BIGINT NOT NULL DEFAULT 1
 );
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1
+		FROM pg_constraint
+		WHERE conrelid = 'tasks'::regclass
+			AND conname = 'tasks_status_check'
+			AND pg_get_constraintdef(oid) LIKE '%in_progress%'
+	) THEN
+		ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
+		ALTER TABLE tasks ADD CONSTRAINT tasks_status_check CHECK (status IN ('todo', 'in_progress', 'done'));
+	END IF;
+END
+$$;
 CREATE TABLE IF NOT EXISTS dependencies (
 	task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
 	depends_on_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -275,13 +289,13 @@ func (s *Store) List(ctx context.Context) ([]task.Task, error) {
 	`)
 }
 
-// Tasks returns every task ordered todo-first then newest-first, matching the
-// fixed projection the web UI renders.
+// Tasks returns every task ordered by workflow state then newest-first,
+// matching the fixed projection the web UI renders.
 func (s *Store) Tasks(ctx context.Context) ([]task.Task, error) {
 	return s.projection(ctx, `
 		SELECT id, title, description, status, created_at, updated_at, version
 		FROM tasks
-		ORDER BY CASE status WHEN 'todo' THEN 0 ELSE 1 END, created_at DESC
+		ORDER BY CASE status WHEN 'todo' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END, created_at DESC
 	`)
 }
 

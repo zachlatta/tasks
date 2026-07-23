@@ -83,11 +83,22 @@ type session struct {
 type sessionContextKey struct{}
 
 type pageData struct {
-	Error      string
-	CSRF       string
-	Tasks      []task.Task
-	Message    string
-	SingleTask bool
+	Error           string
+	CSRF            string
+	TodoTasks       []taskCard
+	InProgressTasks []taskCard
+	DoneTasks       []taskCard
+	DetailTask      taskCard
+	TaskCount       int
+	Message         string
+	SingleTask      bool
+}
+
+type taskCard struct {
+	task.Task
+	CSRF        string
+	Action      string
+	ActionLabel string
 }
 
 func New(config Config) http.Handler {
@@ -116,6 +127,7 @@ func New(config Config) http.Handler {
 	h.mux.Handle("GET /{$}", h.requireSession(http.HandlerFunc(h.index)))
 	h.mux.Handle("POST /logout", h.requireSession(http.HandlerFunc(h.logout)))
 	h.mux.Handle("POST /tasks", h.requireSession(http.HandlerFunc(h.createTask)))
+	h.mux.Handle("POST /tasks/{id}/start", h.requireSession(http.HandlerFunc(h.startTask)))
 	h.mux.Handle("POST /tasks/{id}/done", h.requireSession(http.HandlerFunc(h.completeTask)))
 	h.mux.Handle("POST /tasks/{id}/images", h.requireSession(http.HandlerFunc(h.uploadImage)))
 	h.mux.Handle("GET /images/{key...}", h.requireSession(http.HandlerFunc(h.image)))
@@ -178,7 +190,23 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	current := r.Context().Value(sessionContextKey{}).(session)
-	h.render(w, http.StatusOK, "index.html", pageData{CSRF: current.CSRF, Tasks: items, Message: r.URL.Query().Get("message")})
+	data := pageData{
+		CSRF:      current.CSRF,
+		TaskCount: len(items),
+		Message:   r.URL.Query().Get("message"),
+	}
+	for _, item := range items {
+		card := newTaskCard(item, current.CSRF)
+		switch item.Status {
+		case task.StatusInProgress:
+			data.InProgressTasks = append(data.InProgressTasks, card)
+		case task.StatusDone:
+			data.DoneTasks = append(data.DoneTasks, card)
+		default:
+			data.TodoTasks = append(data.TodoTasks, card)
+		}
+	}
+	h.render(w, http.StatusOK, "index.html", data)
 }
 
 func (h *handler) task(w http.ResponseWriter, r *http.Request) {
@@ -194,7 +222,7 @@ func (h *handler) task(w http.ResponseWriter, r *http.Request) {
 	current := r.Context().Value(sessionContextKey{}).(session)
 	h.render(w, http.StatusOK, "index.html", pageData{
 		CSRF:       current.CSRF,
-		Tasks:      []task.Task{item},
+		DetailTask: newTaskCard(item, current.CSRF),
 		Message:    r.URL.Query().Get("message"),
 		SingleTask: true,
 	})
@@ -217,6 +245,18 @@ func (h *handler) createTask(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?message=Created+"+created.ID, http.StatusSeeOther)
 }
 
+func (h *handler) startTask(w http.ResponseWriter, r *http.Request) {
+	if !h.validCSRF(r) {
+		http.Error(w, "invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	if _, err := h.tasks.Start(webMutationContext(r.Context()), r.PathValue("id")); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/?message=Task+started", http.StatusSeeOther)
+}
+
 func (h *handler) completeTask(w http.ResponseWriter, r *http.Request) {
 	if !h.validCSRF(r) {
 		http.Error(w, "invalid CSRF token", http.StatusForbidden)
@@ -231,6 +271,19 @@ func (h *handler) completeTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/?message=Task+completed", http.StatusSeeOther)
+}
+
+func newTaskCard(item task.Task, csrf string) taskCard {
+	card := taskCard{Task: item, CSRF: csrf}
+	switch item.Status {
+	case task.StatusTodo:
+		card.Action = "/tasks/" + item.ID + "/start"
+		card.ActionLabel = "Start task"
+	case task.StatusInProgress:
+		card.Action = "/tasks/" + item.ID + "/done"
+		card.ActionLabel = "Mark done"
+	}
+	return card
 }
 
 func (h *handler) uploadImage(w http.ResponseWriter, r *http.Request) {

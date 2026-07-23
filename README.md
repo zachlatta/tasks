@@ -3,7 +3,7 @@
 A small, self-hosted task manager with one shared Go backend and three interfaces:
 
 - a `tasks` CLI;
-- a secret-protected web UI; and
+- a secret-protected three-column kanban web UI; and
 - an OAuth-protected MCP server over Streamable HTTP.
 
 Tasks live in PostgreSQL as the single source of truth. Every user-facing read goes through read-only SQL against those tables, while create/complete operations go through the shared task service. Every successful mutation also appends an immutable before/after revision in the same database transaction.
@@ -41,6 +41,8 @@ tasks version
 
 The CLI has no `list` or `show` shortcut. Every user-facing read goes through read-only SQL and is returned as structured JSON. The web UI uses fixed SQL against the same projection, while mutations from every interface still go through `internal/task.Service`.
 
+The web homepage groups tasks into **To do**, **In progress**, and **Done**. Starting a task moves it into progress; completing it moves it to done.
+
 ```sh
 tasks query 'SELECT id, status, blocked, title FROM task_overview ORDER BY created_at DESC'
 tasks query "SELECT version, action, actor_kind, source, occurred_at, before_state, after_state FROM task_revisions WHERE task_id = '<task-id>' ORDER BY version"
@@ -67,7 +69,7 @@ ORDER BY table_name, ordinal_position;
 
 Each read runs inside a PostgreSQL `READ ONLY` transaction; the CLI and MCP layers also reject statements that do not begin with `SELECT`, `WITH`, or `EXPLAIN`. The intentionally small schema is:
 
-- `tasks(id, title, description, status, created_at, updated_at, version)`
+- `tasks(id, title, description, status, created_at, updated_at, version)`, where status is `todo`, `in_progress`, or `done`
 - `dependencies(task_id, depends_on_id)`
 - `images(task_id, object_key, name, content_type)`
 - `task_revisions(revision_id, task_id, version, action, actor_kind, actor_id, source, request_id, occurred_at, before_state, after_state, metadata)`
