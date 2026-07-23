@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,10 +30,10 @@ import (
 var version = "dev"
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		usage(stderr)
 		return 2
@@ -44,7 +45,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "help", "--help", "-h":
 		usage(stdout)
 		return 0
-	case "add", "query", "done", "serve":
+	case "add", "edit", "query", "done", "serve":
 		// These commands operate on stored tasks and need the database below.
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
@@ -91,6 +92,64 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		fmt.Fprintf(stdout, "created %s\n", created.ID)
+		return 0
+	case "edit":
+		flags := flag.NewFlagSet("edit", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		var title optionalString
+		var description optionalString
+		var descriptionFile optionalString
+		var dependencies optionalString
+		var expectedVersion optionalPositiveInt64
+		flags.Var(&title, "title", "complete replacement title")
+		flags.Var(&description, "description", "complete replacement Markdown description")
+		flags.Var(&descriptionFile, "description-file", "read replacement Markdown description from a file, or - for stdin")
+		flags.Var(&dependencies, "depends-on", "complete replacement comma-separated dependency task IDs; empty clears")
+		flags.Var(&expectedVersion, "expected-version", "fail if the stored task version differs")
+		if err := flags.Parse(args[1:]); err != nil {
+			return 2
+		}
+		if len(flags.Args()) != 1 {
+			fmt.Fprintln(stderr, "Usage: tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--expected-version n] <task-id>")
+			return 2
+		}
+		if description.set && descriptionFile.set {
+			fmt.Fprintln(stderr, "edit task: --description and --description-file cannot be used together")
+			return 2
+		}
+		if !title.set && !description.set && !descriptionFile.set && !dependencies.set {
+			fmt.Fprintln(stderr, "edit task: at least one of --title, --description, --description-file, or --depends-on is required")
+			return 2
+		}
+
+		input := task.EditInput{}
+		if title.set {
+			input.Title = &title.value
+		}
+		if description.set {
+			input.Description = &description.value
+		}
+		if descriptionFile.set {
+			value, err := readTextInput(stdin, descriptionFile.value)
+			if err != nil {
+				fmt.Fprintf(stderr, "edit task: read description: %v\n", err)
+				return 1
+			}
+			input.Description = &value
+		}
+		if dependencies.set {
+			values := strings.Split(dependencies.value, ",")
+			input.Dependencies = &values
+		}
+		if expectedVersion.set {
+			input.ExpectedVersion = &expectedVersion.value
+		}
+		edited, err := service.Edit(mutationContext, flags.Args()[0], input)
+		if err != nil {
+			fmt.Fprintf(stderr, "edit task: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "edited %s (version %d)\n", edited.ID, edited.Version)
 		return 0
 	case "query":
 		if len(args) < 2 {
@@ -205,9 +264,66 @@ func configuredObjectStore(loaded config.Config) (objectstore.Store, error) {
 	})
 }
 
+type optionalString struct {
+	value string
+	set   bool
+}
+
+func (value *optionalString) String() string {
+	return value.value
+}
+
+func (value *optionalString) Set(input string) error {
+	value.value = input
+	value.set = true
+	return nil
+}
+
+type optionalPositiveInt64 struct {
+	value int64
+	set   bool
+}
+
+func (value *optionalPositiveInt64) String() string {
+	if !value.set {
+		return ""
+	}
+	return strconv.FormatInt(value.value, 10)
+}
+
+func (value *optionalPositiveInt64) Set(input string) error {
+	parsed, err := strconv.ParseInt(input, 10, 64)
+	if err != nil {
+		return fmt.Errorf("must be a positive integer: %w", err)
+	}
+	if parsed < 1 {
+		return errors.New("must be a positive integer")
+	}
+	value.value = parsed
+	value.set = true
+	return nil
+}
+
+func readTextInput(stdin io.Reader, path string) (string, error) {
+	var (
+		content []byte
+		err     error
+	)
+	if path == "-" {
+		content, err = io.ReadAll(stdin)
+	} else {
+		content, err = os.ReadFile(path)
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
+}
+
 func usage(output io.Writer) {
 	fmt.Fprintln(output, `Usage:
   tasks add [--description text] [--depends-on id,id] <title>
+  tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--expected-version n] <task-id>
   tasks query <read-only-sql>
   tasks done <task-id>
   tasks serve

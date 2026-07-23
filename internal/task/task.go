@@ -58,6 +58,33 @@ type CreateInput struct {
 	Dependencies []string `json:"dependencies,omitempty"`
 }
 
+type TextField string
+
+const (
+	TextFieldTitle       TextField = "title"
+	TextFieldDescription TextField = "description"
+)
+
+// TextReplacement is a guarded, literal replacement applied to one text
+// field. Unless ReplaceAll is true, OldText must occur exactly once.
+type TextReplacement struct {
+	Field      TextField `json:"field" jsonschema:"Text field to edit. Must be title or description."`
+	OldText    string    `json:"old_text" jsonschema:"Exact non-empty text to find. By default it must occur exactly once."`
+	NewText    string    `json:"new_text" jsonschema:"Literal replacement text. May be empty to delete the matched text."`
+	ReplaceAll bool      `json:"replace_all,omitempty" jsonschema:"Replace every occurrence instead of requiring exactly one match."`
+}
+
+// EditInput describes one atomic task edit. Pointer fields distinguish an
+// omitted field from a request to clear it. Replacements run in order after
+// any whole-field values have been applied.
+type EditInput struct {
+	Title           *string
+	Description     *string
+	Dependencies    *[]string
+	Replacements    []TextReplacement
+	ExpectedVersion *int64
+}
+
 // AuditMetadata describes who initiated a task mutation and through which
 // interface. Service methods add the semantic action before the repository
 // persists the mutation.
@@ -173,6 +200,70 @@ func (s *Service) Start(ctx context.Context, id string) (Task, error) {
 	return clone(current), nil
 }
 
+// Edit atomically replaces whole mutable fields and/or applies guarded text
+// replacements. It preserves workflow status, timestamps of creation, and
+// attachments.
+func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, error) {
+	if input.Title == nil &&
+		input.Description == nil &&
+		input.Dependencies == nil &&
+		len(input.Replacements) == 0 {
+		return Task{}, fmt.Errorf("%w: at least one edit is required", ErrInvalid)
+	}
+	if input.ExpectedVersion != nil && *input.ExpectedVersion < 1 {
+		return Task{}, fmt.Errorf("%w: expected version must be positive", ErrInvalid)
+	}
+
+	current, err := s.repository.Get(ctx, id)
+	if err != nil {
+		return Task{}, err
+	}
+	if input.ExpectedVersion != nil && current.Version != *input.ExpectedVersion {
+		return Task{}, fmt.Errorf(
+			"%w: expected version %d, found %d",
+			ErrConflict, *input.ExpectedVersion, current.Version,
+		)
+	}
+
+	edited := clone(current)
+	if input.Title != nil {
+		edited.Title = *input.Title
+	}
+	if input.Description != nil {
+		edited.Description = *input.Description
+	}
+	if input.Dependencies != nil {
+		edited.Dependencies = uniqueNonEmpty(*input.Dependencies)
+	}
+	for index, replacement := range input.Replacements {
+		if err := applyTextReplacement(&edited, replacement); err != nil {
+			return Task{}, fmt.Errorf("replacement %d: %w", index+1, err)
+		}
+	}
+
+	edited.Title = strings.TrimSpace(edited.Title)
+	if edited.Title == "" {
+		return Task{}, fmt.Errorf("%w: title is required", ErrInvalid)
+	}
+	if input.Dependencies != nil {
+		if err := s.validateEditedDependencies(ctx, edited.ID, edited.Dependencies); err != nil {
+			return Task{}, err
+		}
+	}
+	if edited.Title == current.Title &&
+		edited.Description == current.Description &&
+		slices.Equal(edited.Dependencies, current.Dependencies) {
+		return clone(current), nil
+	}
+
+	edited.UpdatedAt = s.now().UTC()
+	edited.Version++
+	if err := s.repository.Update(withAuditAction(ctx, "edit"), edited); err != nil {
+		return Task{}, err
+	}
+	return clone(edited), nil
+}
+
 func (s *Service) Get(ctx context.Context, id string) (Task, error) {
 	item, err := s.repository.Get(ctx, id)
 	return clone(item), err
@@ -234,6 +325,78 @@ func uniqueNonEmpty(values []string) []string {
 		}
 	}
 	return result
+}
+
+func applyTextReplacement(item *Task, replacement TextReplacement) error {
+	if replacement.OldText == "" {
+		return fmt.Errorf("%w: old_text is required", ErrInvalid)
+	}
+	var field *string
+	switch replacement.Field {
+	case TextFieldTitle:
+		field = &item.Title
+	case TextFieldDescription:
+		field = &item.Description
+	default:
+		return fmt.Errorf("%w: field must be title or description", ErrInvalid)
+	}
+
+	matches := strings.Count(*field, replacement.OldText)
+	if matches == 0 {
+		return fmt.Errorf("%w: old_text was not found in %s", ErrInvalid, replacement.Field)
+	}
+	if !replacement.ReplaceAll && matches != 1 {
+		return fmt.Errorf(
+			"%w: old_text occurs %d times in %s; provide more context or set replace_all",
+			ErrInvalid, matches, replacement.Field,
+		)
+	}
+	limit := 1
+	if replacement.ReplaceAll {
+		limit = -1
+	}
+	*field = strings.Replace(*field, replacement.OldText, replacement.NewText, limit)
+	return nil
+}
+
+func (s *Service) validateEditedDependencies(ctx context.Context, taskID string, dependencies []string) error {
+	if len(dependencies) == 0 {
+		return nil
+	}
+	items, err := s.repository.List(ctx)
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]Task, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+	}
+	for _, dependency := range dependencies {
+		if _, ok := byID[dependency]; !ok {
+			return fmt.Errorf("%w: %s", ErrDependencyNotFound, dependency)
+		}
+		if dependencyReaches(dependency, taskID, byID, make(map[string]bool)) {
+			return fmt.Errorf("%w: dependency %s would create a cycle", ErrInvalid, dependency)
+		}
+	}
+	return nil
+}
+
+func dependencyReaches(currentID, targetID string, tasks map[string]Task, visiting map[string]bool) bool {
+	if currentID == targetID {
+		return true
+	}
+	if visiting[currentID] {
+		return false
+	}
+	visiting[currentID] = true
+	defer delete(visiting, currentID)
+	for _, dependency := range tasks[currentID].Dependencies {
+		if dependencyReaches(dependency, targetID, tasks, visiting) {
+			return true
+		}
+	}
+	return false
 }
 
 func withAuditAction(ctx context.Context, action string) context.Context {

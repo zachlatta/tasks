@@ -36,6 +36,10 @@ func TestServiceMutationsRecordCompleteTaskRevisions(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddAttachment: %v", err)
 	}
+	editedDescription := "Edited description"
+	if _, err := service.Edit(ctx, created.ID, task.EditInput{Description: &editedDescription}); err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
 	if _, err := service.Complete(ctx, created.ID); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -49,10 +53,10 @@ func TestServiceMutationsRecordCompleteTaskRevisions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query revisions: %v", err)
 	}
-	if len(result.Rows) != 4 {
-		t.Fatalf("revision count = %d, want 4; rows = %#v", len(result.Rows), result.Rows)
+	if len(result.Rows) != 5 {
+		t.Fatalf("revision count = %d, want 5; rows = %#v", len(result.Rows), result.Rows)
 	}
-	wantActions := []string{"create", "start", "add_attachment", "complete"}
+	wantActions := []string{"create", "start", "add_attachment", "edit", "complete"}
 	for i, want := range wantActions {
 		if got := fmt.Sprint(result.Rows[i]["action"]); got != want {
 			t.Fatalf("revision %d action = %q, want %q", i, got, want)
@@ -86,8 +90,17 @@ func TestServiceMutationsRecordCompleteTaskRevisions(t *testing.T) {
 	if len(attachmentState.Attachments) != 1 || attachmentState.Attachments[0].Key != "audit-me/evidence.png" {
 		t.Fatalf("attachment snapshot = %#v", attachmentState)
 	}
+	var editedState task.Task
+	if err := decodeSnapshot(result.Rows[3]["after_state"], &editedState); err != nil {
+		t.Fatalf("decode edit snapshot: %v", err)
+	}
+	if editedState.Description != editedDescription ||
+		editedState.Status != task.StatusInProgress ||
+		len(editedState.Attachments) != 1 {
+		t.Fatalf("edit snapshot = %#v", editedState)
+	}
 	var completedState task.Task
-	if err := decodeSnapshot(result.Rows[3]["after_state"], &completedState); err != nil {
+	if err := decodeSnapshot(result.Rows[4]["after_state"], &completedState); err != nil {
 		t.Fatalf("decode complete snapshot: %v", err)
 	}
 	if completedState.Status != task.StatusDone {

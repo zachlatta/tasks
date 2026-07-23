@@ -132,6 +132,173 @@ func TestCreateRejectsBlankTitle(t *testing.T) {
 	}
 }
 
+func TestEditUpdatesFieldsAndAppliesGuardedTextReplacements(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC)
+	ids := []string{"dependency", "editable"}
+	service := NewService(repo, func() time.Time { return now }, func() string {
+		id := ids[0]
+		ids = ids[1:]
+		return id
+	})
+	dependency, err := service.Create(context.Background(), CreateInput{Title: "Dependency"})
+	if err != nil {
+		t.Fatalf("Create dependency: %v", err)
+	}
+	created, err := service.Create(context.Background(), CreateInput{
+		Title:       "Research sources",
+		Description: "Find source. Summarize source.",
+	})
+	if err != nil {
+		t.Fatalf("Create editable task: %v", err)
+	}
+
+	now = now.Add(time.Hour)
+	title := "Research primary sources"
+	description := "Find primary source. Summarize primary source."
+	dependencies := []string{dependency.ID, dependency.ID, ""}
+	expectedVersion := created.Version
+	updated, err := service.Edit(context.Background(), created.ID, EditInput{
+		Title:           &title,
+		Description:     &description,
+		Dependencies:    &dependencies,
+		ExpectedVersion: &expectedVersion,
+	})
+	if err != nil {
+		t.Fatalf("Edit fields: %v", err)
+	}
+	if updated.Title != title || updated.Description != description {
+		t.Fatalf("updated text = %q / %q", updated.Title, updated.Description)
+	}
+	if !slices.Equal(updated.Dependencies, []string{dependency.ID}) {
+		t.Fatalf("updated dependencies = %v", updated.Dependencies)
+	}
+	if updated.Version != 2 || !updated.UpdatedAt.Equal(now) {
+		t.Fatalf("updated version/time = %d/%v, want 2/%v", updated.Version, updated.UpdatedAt, now)
+	}
+
+	now = now.Add(time.Hour)
+	updated, err = service.Edit(context.Background(), created.ID, EditInput{
+		Replacements: []TextReplacement{
+			{Field: TextFieldDescription, OldText: "primary source", NewText: "primary source document", ReplaceAll: true},
+			{Field: TextFieldTitle, OldText: "primary sources", NewText: "primary source documents"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Edit replacements: %v", err)
+	}
+	if updated.Title != "Research primary source documents" {
+		t.Fatalf("replacement title = %q", updated.Title)
+	}
+	if updated.Description != "Find primary source document. Summarize primary source document." {
+		t.Fatalf("replacement description = %q", updated.Description)
+	}
+	if updated.Version != 3 || !updated.UpdatedAt.Equal(now) {
+		t.Fatalf("replacement version/time = %d/%v, want 3/%v", updated.Version, updated.UpdatedAt, now)
+	}
+}
+
+func TestEditRejectsAmbiguousOrStaleChangesAtomically(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	service := NewService(repo, time.Now, func() string { return "editable" })
+	created, err := service.Create(context.Background(), CreateInput{
+		Title:       "Review sources",
+		Description: "source and source",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	_, err = service.Edit(context.Background(), created.ID, EditInput{
+		Replacements: []TextReplacement{
+			{Field: TextFieldTitle, OldText: "Review", NewText: "Inspect"},
+			{Field: TextFieldDescription, OldText: "source", NewText: "document"},
+		},
+	})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("ambiguous Edit error = %v, want ErrInvalid", err)
+	}
+	afterAmbiguous, err := service.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get after ambiguous edit: %v", err)
+	}
+	if afterAmbiguous.Title != created.Title || afterAmbiguous.Description != created.Description || afterAmbiguous.Version != created.Version {
+		t.Fatalf("task changed after ambiguous edit: %#v", afterAmbiguous)
+	}
+
+	staleVersion := created.Version + 1
+	title := "Stale title"
+	_, err = service.Edit(context.Background(), created.ID, EditInput{
+		Title:           &title,
+		ExpectedVersion: &staleVersion,
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale Edit error = %v, want ErrConflict", err)
+	}
+}
+
+func TestEditRejectsInvalidTitleAndDependencyCycles(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	ids := []string{"first", "second"}
+	service := NewService(repo, time.Now, func() string {
+		id := ids[0]
+		ids = ids[1:]
+		return id
+	})
+	first, err := service.Create(context.Background(), CreateInput{Title: "First"})
+	if err != nil {
+		t.Fatalf("Create first: %v", err)
+	}
+	second, err := service.Create(context.Background(), CreateInput{
+		Title:        "Second",
+		Dependencies: []string{first.ID},
+	})
+	if err != nil {
+		t.Fatalf("Create second: %v", err)
+	}
+
+	blank := "   "
+	if _, err := service.Edit(context.Background(), first.ID, EditInput{Title: &blank}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("blank title Edit error = %v, want ErrInvalid", err)
+	}
+	unknown := []string{"missing"}
+	if _, err := service.Edit(context.Background(), first.ID, EditInput{Dependencies: &unknown}); !errors.Is(err, ErrDependencyNotFound) {
+		t.Fatalf("unknown dependency Edit error = %v, want ErrDependencyNotFound", err)
+	}
+	cycle := []string{second.ID}
+	if _, err := service.Edit(context.Background(), first.ID, EditInput{Dependencies: &cycle}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cyclic dependency Edit error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestEditRequiresARequestedChangeAndSkipsNoOpWrites(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	service := NewService(repo, time.Now, func() string { return "editable" })
+	created, err := service.Create(context.Background(), CreateInput{Title: "Same"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := service.Edit(context.Background(), created.ID, EditInput{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty Edit error = %v, want ErrInvalid", err)
+	}
+	sameTitle := created.Title
+	unchanged, err := service.Edit(context.Background(), created.ID, EditInput{Title: &sameTitle})
+	if err != nil {
+		t.Fatalf("no-op Edit: %v", err)
+	}
+	if unchanged.Version != created.Version || !unchanged.UpdatedAt.Equal(created.UpdatedAt) {
+		t.Fatalf("no-op Edit changed version/time: %#v", unchanged)
+	}
+}
+
 type memoryRepository struct {
 	tasks map[string]Task
 }

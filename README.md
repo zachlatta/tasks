@@ -6,7 +6,7 @@ A small, self-hosted task manager with one shared Go backend and three interface
 - a secret-protected three-column kanban web UI; and
 - an OAuth-protected MCP server over Streamable HTTP.
 
-Tasks live in PostgreSQL as the single source of truth. Every user-facing read goes through read-only SQL against those tables, while create/complete operations go through the shared task service. Every successful mutation also appends an immutable before/after revision in the same database transaction.
+Tasks live in PostgreSQL as the single source of truth. Every user-facing read goes through read-only SQL against those tables, while create/edit/start/complete operations go through the shared task service. Every successful mutation also appends an immutable before/after revision in the same database transaction.
 
 ## Quick start
 
@@ -33,6 +33,7 @@ The schema (`tasks`, `dependencies`, `images`, and the `task_overview` view) is 
 
 ```text
 tasks add [--description text] [--depends-on id,id] <title>
+tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--expected-version n] <task-id>
 tasks query <read-only-sql>
 tasks done <task-id>
 tasks serve
@@ -40,6 +41,15 @@ tasks version
 ```
 
 The CLI has no `list` or `show` shortcut. Every user-facing read goes through read-only SQL and is returned as structured JSON. The web UI uses fixed SQL against the same projection, while mutations from every interface still go through `internal/task.Service`.
+
+`tasks edit` replaces only the fields named by flags. Use `--description-file` for longer Markdown; `-` reads it from stdin. Passing an empty `--description` clears the description, and an empty `--depends-on` clears all dependencies. `--expected-version` is optional optimistic concurrency protection for scripts that first read a task.
+
+```sh
+tasks edit --title "Research primary sources" <task-id>
+tasks edit --description-file notes.md --expected-version 3 <task-id>
+cat notes.md | tasks edit --description-file - <task-id>
+tasks edit --depends-on prerequisite-id,other-id <task-id>
+```
 
 The web homepage groups tasks into **To do**, **In progress**, and **Done**. Starting a task moves it into progress; completing it moves it to done.
 
@@ -55,8 +65,12 @@ The MCP endpoint is `https://your-host.example/mcp`. It implements Streamable HT
 Available tools:
 
 - `query_tasks_sql`: arbitrary read-only PostgreSQL `SELECT`, `WITH`, or `EXPLAIN` queries, capped at 500 rows, including task revision history;
-- `create_task`: create a todo, optionally with dependency IDs; and
+- `create_task`: create a todo, optionally with dependency IDs;
+- `edit_task_text`: atomically apply one or more exact `old_text`/`new_text` replacements to a task title or description;
+- `update_task`: replace any supplied title, description, or complete dependency list; and
 - `complete_task`: mark a task done once its dependencies are done.
+
+`edit_task_text` is intended for agent-authored contextual edits. Replacements run in order in one transaction. By default each `old_text` must occur exactly once; missing or ambiguous text fails the whole call, while `replace_all: true` explicitly replaces every occurrence. `update_task` is the whole-field equivalent: omitted fields remain unchanged, while empty description text or an empty dependency list clears the field. Both tools accept an optional `expected_version` from a prior query so a stale agent cannot overwrite a newer task. Dependency edits reject missing tasks and cycles.
 
 There is deliberately no MCP `list_tasks` tool. Trusted agents can inspect the schema with:
 
@@ -79,7 +93,7 @@ Each read runs inside a PostgreSQL `READ ONLY` transaction; the CLI and MCP laye
 
 ## Revision history
 
-`task_revisions` is an append-only, Git-like history of successful task changes. Creating, completing, or attaching an image updates the current task and records one revision atomically. A failed or blocked operation records nothing, and repeating completion on an already-done task is a no-op.
+`task_revisions` is an append-only, Git-like history of successful task changes. Creating, editing, starting, completing, or attaching an image updates the current task and records one revision atomically. A failed or blocked operation records nothing, and edits that produce no change or repeated completion on an already-done task are no-ops.
 
 Each revision contains:
 
