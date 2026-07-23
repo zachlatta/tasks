@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zachlatta/task-tracker/internal/auth"
-	"github.com/zachlatta/task-tracker/internal/objectstore"
-	"github.com/zachlatta/task-tracker/internal/task"
-	"github.com/zachlatta/task-tracker/internal/tasktest"
+	"github.com/zachlatta/tasks/internal/auth"
+	"github.com/zachlatta/tasks/internal/objectstore"
+	"github.com/zachlatta/tasks/internal/task"
+	"github.com/zachlatta/tasks/internal/tasktest"
 )
 
 func TestLoginProtectsTaskPage(t *testing.T) {
@@ -43,12 +43,18 @@ func TestLoginProtectsTaskPage(t *testing.T) {
 	if login.Code != http.StatusSeeOther || len(login.Result().Cookies()) != 1 {
 		t.Fatalf("login response = %d, cookies = %#v", login.Code, login.Result().Cookies())
 	}
+	if cookie := login.Result().Cookies()[0]; cookie.Name != "tasks_session" {
+		t.Fatalf("session cookie = %q, want tasks_session", cookie.Name)
+	}
 	page := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	request.AddCookie(login.Result().Cookies()[0])
 	handler.ServeHTTP(page, request)
 	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), created.Title) {
 		t.Fatalf("task page status = %d; body: %s", page.Code, page.Body.String())
+	}
+	if body := page.Body.String(); !strings.Contains(body, "<title>Tasks</title>") {
+		t.Fatalf("index page identity is stale; body: %s", body)
 	}
 	// The page must describe the real storage backend, not the pre-migration one.
 	if body := page.Body.String(); !strings.Contains(body, "POSTGRES-BACKED") || strings.Contains(body, "MARKDOWN-BACKED") {

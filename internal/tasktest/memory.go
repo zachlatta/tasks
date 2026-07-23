@@ -9,7 +9,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/zachlatta/task-tracker/internal/task"
+	"github.com/zachlatta/tasks/internal/task"
 )
 
 // Repository is a goroutine-safe, in-memory implementation of task.Repository.

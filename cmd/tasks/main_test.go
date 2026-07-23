@@ -5,11 +5,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zachlatta/task-tracker/internal/pgtest"
+	"github.com/zachlatta/tasks/internal/pgtest"
 )
 
 func TestCLIAddQueryAndComplete(t *testing.T) {
-	t.Setenv("TASK_TRACKER_DATABASE_URL", pgtest.URL(t))
+	t.Setenv("TASKS_DATABASE_URL", pgtest.URL(t))
 	var output bytes.Buffer
 	var errors bytes.Buffer
 	if code := run([]string{"add", "Test the CLI"}, &output, &errors); code != 0 {
@@ -57,7 +57,7 @@ func TestCLIHasNoListCommand(t *testing.T) {
 }
 
 func TestCLIQueryRejectsWrites(t *testing.T) {
-	t.Setenv("TASK_TRACKER_DATABASE_URL", pgtest.URL(t))
+	t.Setenv("TASKS_DATABASE_URL", pgtest.URL(t))
 	var output bytes.Buffer
 	var errors bytes.Buffer
 	if code := run([]string{"query", "DELETE FROM tasks"}, &output, &errors); code != 1 {
@@ -74,7 +74,18 @@ func TestCLIRejectsMissingCommand(t *testing.T) {
 	if code := run(nil, &output, &errors); code != 2 {
 		t.Fatalf("exit = %d, want 2", code)
 	}
-	if !strings.Contains(errors.String(), "Usage:") {
+	if !strings.Contains(errors.String(), "Usage:\n  tasks add") {
+		t.Fatalf("stderr = %q", errors.String())
+	}
+}
+
+func TestCLIUsesTasksConfigurationName(t *testing.T) {
+	var output bytes.Buffer
+	var errors bytes.Buffer
+	if code := run([]string{"add", "a task"}, &output, &errors); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(errors.String(), "TASKS_DATABASE_URL is required") {
 		t.Fatalf("stderr = %q", errors.String())
 	}
 }

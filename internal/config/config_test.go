@@ -7,15 +7,15 @@ import (
 )
 
 func TestLoadDefaultsToHostedPublicURL(t *testing.T) {
-	previous, existed := os.LookupEnv("TASK_TRACKER_PUBLIC_URL")
-	if err := os.Unsetenv("TASK_TRACKER_PUBLIC_URL"); err != nil {
-		t.Fatalf("unset TASK_TRACKER_PUBLIC_URL: %v", err)
+	previous, existed := os.LookupEnv("TASKS_PUBLIC_URL")
+	if err := os.Unsetenv("TASKS_PUBLIC_URL"); err != nil {
+		t.Fatalf("unset TASKS_PUBLIC_URL: %v", err)
 	}
 	t.Cleanup(func() {
 		if existed {
-			_ = os.Setenv("TASK_TRACKER_PUBLIC_URL", previous)
+			_ = os.Setenv("TASKS_PUBLIC_URL", previous)
 		} else {
-			_ = os.Unsetenv("TASK_TRACKER_PUBLIC_URL")
+			_ = os.Unsetenv("TASKS_PUBLIC_URL")
 		}
 	})
 
@@ -23,18 +23,21 @@ func TestLoadDefaultsToHostedPublicURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if loaded.PublicURL != "https://task-tracker.zachlatta.com" {
+	if loaded.PublicURL != "https://tasks.hackclub.com" {
 		t.Fatalf("PublicURL = %q, want hosted URL", loaded.PublicURL)
+	}
+	if filepath.Base(loaded.DataDir) != "tasks" {
+		t.Fatalf("DataDir = %q, want tasks config directory", loaded.DataDir)
 	}
 }
 
 func TestLoadUsesEnvironmentBeforeDotEnv(t *testing.T) {
 	directory := t.TempDir()
 	dotenv := filepath.Join(directory, ".env")
-	if err := os.WriteFile(dotenv, []byte("TASK_TRACKER_SECRET=from-file\nTASK_TRACKER_ADDR=127.0.0.1:7000\nTASK_TRACKER_DATABASE_URL=postgres://localhost:5432/tasks\nTASK_TRACKER_DATA_DIR="+filepath.Join(directory, "data")+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(dotenv, []byte("TASKS_SECRET=from-file\nTASKS_ADDR=127.0.0.1:7000\nTASKS_DATABASE_URL=postgres://localhost:5432/tasks\nTASKS_DATA_DIR="+filepath.Join(directory, "data")+"\n"), 0o600); err != nil {
 		t.Fatalf("write .env: %v", err)
 	}
-	t.Setenv("TASK_TRACKER_ADDR", "127.0.0.1:9000")
+	t.Setenv("TASKS_ADDR", "127.0.0.1:9000")
 
 	loaded, err := Load(dotenv)
 	if err != nil {

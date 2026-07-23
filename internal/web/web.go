@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zachlatta/task-tracker/internal/auth"
-	"github.com/zachlatta/task-tracker/internal/objectstore"
-	"github.com/zachlatta/task-tracker/internal/task"
+	"github.com/zachlatta/tasks/internal/auth"
+	"github.com/zachlatta/tasks/internal/objectstore"
+	"github.com/zachlatta/tasks/internal/task"
 )
 
 // Reader provides the fixed task projection the index page renders. In
@@ -38,7 +38,7 @@ type SessionStore interface {
 }
 
 const (
-	sessionCookie = "task_tracker_session"
+	sessionCookie = "tasks_session"
 	sessionTTL    = 12 * time.Hour
 	maxImageSize  = 10 << 20
 )

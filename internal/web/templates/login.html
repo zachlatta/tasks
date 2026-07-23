@@ -1,5 +1,5 @@
 {{define "login.html"}}<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Task Tracker · Sign in</title><link rel="stylesheet" href="/static/app.css"></head>
-<body class="login"><main class="login-card"><p class="eyebrow">PRIVATE WORKSPACE</p><h1>Task Tracker</h1><p>Enter the shared secret code to continue.</p>{{with .Error}}<p class="error">{{.}}</p>{{end}}<form method="post" action="/login"><label>Secret code<input type="password" name="secret" required autofocus autocomplete="current-password"></label><button type="submit">Open tasks</button></form></main></body>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Tasks · Sign in</title><link rel="stylesheet" href="/static/app.css"></head>
+<body class="login"><main class="login-card"><p class="eyebrow">PRIVATE WORKSPACE</p><h1>Tasks</h1><p>Enter the shared secret code to continue.</p>{{with .Error}}<p class="error">{{.}}</p>{{end}}<form method="post" action="/login"><label>Secret code<input type="password" name="secret" required autofocus autocomplete="current-password"></label><button type="submit">Open tasks</button></form></main></body>
 </html>{{end}}

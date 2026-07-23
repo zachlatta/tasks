@@ -569,9 +569,9 @@ func (m *memoryStore) RefreshToken(_ context.Context, tokenHash string) (Token, 
 
 var authorizationPage = template.Must(template.New("authorize").Parse(`<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Task Tracker</title>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Tasks</title>
 <style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:10vh auto;padding:1.5rem;color:#17202a}form{display:grid;gap:1rem}input,button{font:inherit;padding:.75rem}button{cursor:pointer;background:#17202a;color:white;border:0;border-radius:.35rem}.error{color:#a00}</style></head>
-<body><h1>Authorize Task Tracker</h1><p>Enter the private secret code to let <strong>{{.ClientID}}</strong> read and update tasks.</p>
+<body><h1>Authorize Tasks</h1><p>Enter the private secret code to let <strong>{{.ClientID}}</strong> read and update tasks.</p>
 {{with .Error}}<p class="error">{{.}}</p>{{end}}
 <form method="post" action="/oauth/authorize">
 <input type="hidden" name="client_id" value="{{.ClientID}}"><input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">

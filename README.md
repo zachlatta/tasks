@@ -1,8 +1,8 @@
-# Task Tracker
+# Tasks
 
-A small, self-hosted task tracker with one shared Go backend and three interfaces:
+A small, self-hosted task manager with one shared Go backend and three interfaces:
 
-- a `task-tracker` CLI;
+- a `tasks` CLI;
 - a secret-protected web UI; and
 - an OAuth-protected MCP server over Streamable HTTP.
 
@@ -14,40 +14,40 @@ Requires Go 1.26.5 or newer and a PostgreSQL 13+ server.
 
 ```sh
 cp .env.example .env
-# Set TASK_TRACKER_SECRET and TASK_TRACKER_DATABASE_URL in .env.
+# Set TASKS_SECRET and TASKS_DATABASE_URL in .env.
 
 # For local development you can start Postgres with Docker:
-docker run -d --name task-tracker-pg -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=task_tracker -p 5432:5432 postgres:16-alpine
+docker run -d --name tasks-pg -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=tasks -p 5432:5432 postgres:16-alpine
 
-go run ./cmd/task-tracker add "Write the first task"
-go run ./cmd/task-tracker query 'SELECT id, status, title FROM task_overview'
-go run ./cmd/task-tracker serve
+go run ./cmd/tasks add "Write the first task"
+go run ./cmd/tasks query 'SELECT id, status, title FROM task_overview'
+go run ./cmd/tasks serve
 ```
 
-Open <http://127.0.0.1:8080> and enter the same `TASK_TRACKER_SECRET` from `.env`.
+Open <http://127.0.0.1:8080> and enter the same `TASKS_SECRET` from `.env`.
 
-The schema (`tasks`, `dependencies`, `images`, and the `task_overview` view) is created automatically on first connection. `TASK_TRACKER_DATABASE_URL` is required by every command, not just `serve`.
+The schema (`tasks`, `dependencies`, `images`, and the `task_overview` view) is created automatically on first connection. `TASKS_DATABASE_URL` is required by every command, not just `serve`.
 
 ## CLI
 
 ```text
-task-tracker add [--description text] [--depends-on id,id] <title>
-task-tracker query <read-only-sql>
-task-tracker done <task-id>
-task-tracker serve
-task-tracker version
+tasks add [--description text] [--depends-on id,id] <title>
+tasks query <read-only-sql>
+tasks done <task-id>
+tasks serve
+tasks version
 ```
 
 The CLI has no `list` or `show` shortcut. Every user-facing read goes through read-only SQL and is returned as structured JSON. The web UI uses fixed SQL against the same projection, while mutations from every interface still go through `internal/task.Service`.
 
 ```sh
-task-tracker query 'SELECT id, status, blocked, title FROM task_overview ORDER BY created_at DESC'
+tasks query 'SELECT id, status, blocked, title FROM task_overview ORDER BY created_at DESC'
 ```
 
 ## MCP
 
-The MCP endpoint is `https://your-host.example/mcp`. It implements Streamable HTTP plus OAuth authorization-code flow with S256 PKCE, dynamic client registration, authorization-server metadata, and protected-resource metadata. The authorization page asks the user for `TASK_TRACKER_SECRET`.
+The MCP endpoint is `https://your-host.example/mcp`. It implements Streamable HTTP plus OAuth authorization-code flow with S256 PKCE, dynamic client registration, authorization-server metadata, and protected-resource metadata. The authorization page asks the user for `TASKS_SECRET`.
 
 Available tools:
 
@@ -81,19 +81,19 @@ The process reads `.env` when it starts. Existing environment variables take pre
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `TASK_TRACKER_SECRET` | required for `serve` | Shared secret used by web login and OAuth authorization |
-| `TASK_TRACKER_DATABASE_URL` | required for all commands | PostgreSQL connection string for task storage |
-| `TASK_TRACKER_ADDR` | `127.0.0.1:8080` | HTTP listen address |
-| `TASK_TRACKER_PUBLIC_URL` | `https://task-tracker.zachlatta.com` | Public OAuth issuer origin; HTTPS required off loopback |
-| `TASK_TRACKER_DATA_DIR` | OS user config directory | Default parent directory for local image storage |
-| `TASK_TRACKER_OBJECT_STORE` | `local` | `local` or `s3` |
-| `TASK_TRACKER_LOCAL_OBJECT_DIR` | `<data-dir>/images` | Local development image storage |
-| `TASK_TRACKER_S3_ENDPOINT` | none | S3-compatible endpoint without scheme |
-| `TASK_TRACKER_S3_ACCESS_KEY` | none | S3 access key |
-| `TASK_TRACKER_S3_SECRET_KEY` | none | S3 secret key |
-| `TASK_TRACKER_S3_BUCKET` | none | Existing image bucket |
-| `TASK_TRACKER_S3_REGION` | none | Optional bucket region |
-| `TASK_TRACKER_S3_USE_SSL` | `true` | Use TLS for object storage |
+| `TASKS_SECRET` | required for `serve` | Shared secret used by web login and OAuth authorization |
+| `TASKS_DATABASE_URL` | required for all commands | PostgreSQL connection string for task storage |
+| `TASKS_ADDR` | `127.0.0.1:8080` | HTTP listen address |
+| `TASKS_PUBLIC_URL` | `https://tasks.hackclub.com` | Public OAuth issuer origin; HTTPS required off loopback |
+| `TASKS_DATA_DIR` | OS user config directory | Default parent directory for local image storage |
+| `TASKS_OBJECT_STORE` | `local` | `local` or `s3` |
+| `TASKS_LOCAL_OBJECT_DIR` | `<data-dir>/images` | Local development image storage |
+| `TASKS_S3_ENDPOINT` | none | S3-compatible endpoint without scheme |
+| `TASKS_S3_ACCESS_KEY` | none | S3 access key |
+| `TASKS_S3_SECRET_KEY` | none | S3 secret key |
+| `TASKS_S3_BUCKET` | none | Existing image bucket |
+| `TASKS_S3_REGION` | none | Optional bucket region |
+| `TASKS_S3_USE_SSL` | `true` | Use TLS for object storage |
 
 The S3 credentials belong in deployment secrets, never in a committed `.env` file.
 
@@ -104,12 +104,12 @@ make test
 make build
 ```
 
-The Postgres-backed tests (storage, MCP tools, CLI) are skipped unless `TASK_TRACKER_TEST_DATABASE_URL` points at a reachable server. Each test provisions and drops its own database, so point it at a throwaway instance:
+The Postgres-backed tests (storage, MCP tools, CLI) are skipped unless `TASKS_TEST_DATABASE_URL` points at a reachable server. Each test provisions and drops its own database, so point it at a throwaway instance:
 
 ```sh
-docker run -d --name task-tracker-test-pg -e POSTGRES_PASSWORD=postgres \
+docker run -d --name tasks-test-pg -e POSTGRES_PASSWORD=postgres \
   -p 5432:5432 postgres:16-alpine
-TASK_TRACKER_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable \
+TASKS_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable \
   make test
 ```
 
@@ -122,12 +122,12 @@ Every source commit pushed to `main` runs the full test suite and replaces the r
 Install the latest `main` build through the repository's Homebrew tap:
 
 ```sh
-brew tap zachlatta/task-tracker https://github.com/zachlatta/task-tracker
-brew trust --tap zachlatta/task-tracker
-brew install task-tracker
+brew tap zachlatta/tasks https://github.com/zachlatta/tasks
+brew trust --tap zachlatta/tasks
+brew install tasks
 ```
 
-After later commits reach `main`, update it with `brew update && brew upgrade task-tracker`.
+After later commits reach `main`, update it with `brew update && brew upgrade tasks`.
 
 The release workflows use only the repository-scoped `GITHUB_TOKEN`; no package or object-storage credentials are embedded in builds.
 

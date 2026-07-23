@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zachlatta/task-tracker/internal/auth"
-	"github.com/zachlatta/task-tracker/internal/pgtest"
-	"github.com/zachlatta/task-tracker/internal/task"
+	"github.com/zachlatta/tasks/internal/auth"
+	"github.com/zachlatta/tasks/internal/pgtest"
+	"github.com/zachlatta/tasks/internal/task"
 )
 
 func newStore(t *testing.T) *Store {

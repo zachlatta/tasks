@@ -8,10 +8,39 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/zachlatta/task-tracker/internal/pgtest"
-	"github.com/zachlatta/task-tracker/internal/postgres"
-	"github.com/zachlatta/task-tracker/internal/task"
+	"github.com/zachlatta/tasks/internal/pgtest"
+	"github.com/zachlatta/tasks/internal/postgres"
+	"github.com/zachlatta/tasks/internal/task"
+	"github.com/zachlatta/tasks/internal/tasktest"
 )
+
+type emptyReader struct{}
+
+func (emptyReader) Query(context.Context, string) (postgres.Result, error) {
+	return postgres.Result{}, nil
+}
+
+func TestServerIdentity(t *testing.T) {
+	t.Parallel()
+
+	repository := tasktest.NewRepository()
+	server := New(task.NewService(repository, time.Now, func() string { return "test-id" }), emptyReader{}, "test")
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = server.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	serverInfo := session.InitializeResult().ServerInfo
+	if serverInfo.Name != "tasks" || serverInfo.Title != "Tasks" {
+		t.Fatalf("server info = %#v, want Tasks identity", serverInfo)
+	}
+}
 
 func TestToolsCreateQueryAndCompleteTasks(t *testing.T) {
 	t.Parallel()

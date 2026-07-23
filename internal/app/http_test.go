@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/zachlatta/task-tracker/internal/auth"
+	"github.com/zachlatta/tasks/internal/auth"
 )
 
 func TestHTTPHandlerExposesDiscoveryAndProtectsMCP(t *testing.T) {

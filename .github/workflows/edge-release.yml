@@ -49,14 +49,14 @@ jobs:
         run: |
           version="$(jq -r .version dist/metadata.json)"
           go run ./cmd/update-homebrew-formula \
-            zachlatta/task-tracker \
+            zachlatta/tasks \
             "0.0.0.$GITHUB_RUN_NUMBER" \
             "$version" \
             dist/checksums.txt \
-            Formula/task-tracker.rb
+            Formula/tasks.rb
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/task-tracker.rb
+          git add Formula/tasks.rb
           if git diff --cached --quiet; then
             exit 0
           fi

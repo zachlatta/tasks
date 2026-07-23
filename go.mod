@@ -1,4 +1,4 @@
-module github.com/zachlatta/task-tracker
+module github.com/zachlatta/tasks
 
 go 1.26.5
 

@@ -1,5 +1,5 @@
 .git
 data
 *.db
-task-tracker
+tasks
 .env

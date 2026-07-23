@@ -14,8 +14,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/zachlatta/task-tracker/internal/auth"
-	"github.com/zachlatta/task-tracker/internal/task"
+	"github.com/zachlatta/tasks/internal/auth"
+	"github.com/zachlatta/tasks/internal/task"
 )
 
 const defaultMaxRows = 500

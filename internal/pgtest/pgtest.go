@@ -1,7 +1,7 @@
 // Package pgtest provisions throwaway PostgreSQL databases for tests. Each call
 // to URL creates an isolated database and drops it during test cleanup, so
 // Postgres-backed tests never share state. Tests are skipped unless
-// TASK_TRACKER_TEST_DATABASE_URL points at a reachable server.
+// TASKS_TEST_DATABASE_URL points at a reachable server.
 package pgtest
 
 import (
@@ -18,15 +18,15 @@ import (
 var counter int64
 
 // URL creates a fresh, empty database and returns a connection string for it.
-// It skips the test when TASK_TRACKER_TEST_DATABASE_URL is unset.
+// It skips the test when TASKS_TEST_DATABASE_URL is unset.
 func URL(t testing.TB) string {
 	t.Helper()
-	base := os.Getenv("TASK_TRACKER_TEST_DATABASE_URL")
+	base := os.Getenv("TASKS_TEST_DATABASE_URL")
 	if base == "" {
-		t.Skip("set TASK_TRACKER_TEST_DATABASE_URL to run Postgres-backed tests")
+		t.Skip("set TASKS_TEST_DATABASE_URL to run Postgres-backed tests")
 	}
 	ctx := context.Background()
-	name := fmt.Sprintf("tt_test_%d_%d", os.Getpid(), atomic.AddInt64(&counter, 1))
+	name := fmt.Sprintf("tasks_test_%d_%d", os.Getpid(), atomic.AddInt64(&counter, 1))
 
 	admin, err := pgx.Connect(ctx, base)
 	if err != nil {

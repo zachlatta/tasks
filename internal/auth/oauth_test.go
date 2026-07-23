@@ -43,6 +43,9 @@ func TestOAuthAuthorizationCodeFlow(t *testing.T) {
 	if pageResponse.Code != http.StatusOK || !strings.Contains(pageResponse.Body.String(), `name="secret"`) {
 		t.Fatalf("authorize page status = %d; body: %s", pageResponse.Code, pageResponse.Body.String())
 	}
+	if body := pageResponse.Body.String(); !strings.Contains(body, "Authorize Tasks") {
+		t.Fatalf("authorize page identity is stale; body: %s", body)
+	}
 	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response := httptest.NewRecorder()

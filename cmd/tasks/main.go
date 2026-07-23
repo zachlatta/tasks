@@ -16,14 +16,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/zachlatta/task-tracker/internal/app"
-	"github.com/zachlatta/task-tracker/internal/auth"
-	"github.com/zachlatta/task-tracker/internal/config"
-	"github.com/zachlatta/task-tracker/internal/mcpserver"
-	"github.com/zachlatta/task-tracker/internal/objectstore"
-	"github.com/zachlatta/task-tracker/internal/postgres"
-	"github.com/zachlatta/task-tracker/internal/task"
-	"github.com/zachlatta/task-tracker/internal/web"
+	"github.com/zachlatta/tasks/internal/app"
+	"github.com/zachlatta/tasks/internal/auth"
+	"github.com/zachlatta/tasks/internal/config"
+	"github.com/zachlatta/tasks/internal/mcpserver"
+	"github.com/zachlatta/tasks/internal/objectstore"
+	"github.com/zachlatta/tasks/internal/postgres"
+	"github.com/zachlatta/tasks/internal/task"
+	"github.com/zachlatta/tasks/internal/web"
 )
 
 var version = "dev"
@@ -57,7 +57,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if strings.TrimSpace(loaded.DatabaseURL) == "" {
-		fmt.Fprintln(stderr, "configuration: TASK_TRACKER_DATABASE_URL is required")
+		fmt.Fprintln(stderr, "configuration: TASKS_DATABASE_URL is required")
 		return 1
 	}
 	store, err := postgres.Open(context.Background(), loaded.DatabaseURL)
@@ -90,7 +90,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "query":
 		if len(args) < 2 {
-			fmt.Fprintln(stderr, "Usage: task-tracker query <read-only-sql>")
+			fmt.Fprintln(stderr, "Usage: tasks query <read-only-sql>")
 			return 2
 		}
 		result, err := store.Query(context.Background(), strings.Join(args[1:], " "))
@@ -107,7 +107,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "done":
 		if len(args) != 2 {
-			fmt.Fprintln(stderr, "Usage: task-tracker done <task-id>")
+			fmt.Fprintln(stderr, "Usage: tasks done <task-id>")
 			return 2
 		}
 		completed, err := service.Complete(context.Background(), args[1])
@@ -119,7 +119,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "serve":
 		if len(args) != 1 {
-			fmt.Fprintln(stderr, "Usage: task-tracker serve")
+			fmt.Fprintln(stderr, "Usage: tasks serve")
 			return 2
 		}
 		if err := loaded.ValidateServer(); err != nil {
@@ -177,7 +177,7 @@ func serve(loaded config.Config, service *task.Service, store *postgres.Store, s
 	go func() {
 		serverErrors <- httpServer.ListenAndServe()
 	}()
-	fmt.Fprintf(stdout, "task-tracker %s listening on %s (public URL %s)\n", version, loaded.Address, loaded.PublicURL)
+	fmt.Fprintf(stdout, "tasks %s listening on %s (public URL %s)\n", version, loaded.Address, loaded.PublicURL)
 	select {
 	case err := <-serverErrors:
 		if errors.Is(err, http.ErrServerClosed) {
@@ -203,9 +203,9 @@ func configuredObjectStore(loaded config.Config) (objectstore.Store, error) {
 
 func usage(output io.Writer) {
 	fmt.Fprintln(output, `Usage:
-  task-tracker add [--description text] [--depends-on id,id] <title>
-  task-tracker query <read-only-sql>
-  task-tracker done <task-id>
-  task-tracker serve
-  task-tracker version`)
+  tasks add [--description text] [--depends-on id,id] <title>
+  tasks query <read-only-sql>
+  tasks done <task-id>
+  tasks serve
+  tasks version`)
 }

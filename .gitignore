@@ -4,5 +4,5 @@ dist/
 *.db
 *.db-shm
 *.db-wal
-/task-tracker
+/tasks
 .DS_Store

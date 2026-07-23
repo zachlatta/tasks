@@ -4,8 +4,8 @@ import (
 	"context"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/zachlatta/task-tracker/internal/postgres"
-	"github.com/zachlatta/task-tracker/internal/task"
+	"github.com/zachlatta/tasks/internal/postgres"
+	"github.com/zachlatta/tasks/internal/task"
 )
 
 // Reader runs trusted, read-only SQL against the task tables for agents.
@@ -35,8 +35,8 @@ type CompleteTaskInput struct {
 
 func New(tasks *task.Service, reader Reader, version string) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "task-tracker",
-		Title:   "Task Tracker",
+		Name:    "tasks",
+		Title:   "Tasks",
 		Version: version,
 	}, nil)
 	closedWorld := false

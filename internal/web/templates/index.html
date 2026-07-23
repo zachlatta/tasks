@@ -1,7 +1,7 @@
 {{define "index.html"}}<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Task Tracker</title><link rel="stylesheet" href="/static/app.css"></head>
-<body><header><div><p class="eyebrow">POSTGRES-BACKED</p><h1>Task Tracker</h1></div><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="quiet" type="submit">Sign out</button></form></header><main>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Tasks</title><link rel="stylesheet" href="/static/app.css"></head>
+<body><header><div><p class="eyebrow">POSTGRES-BACKED</p><h1>Tasks</h1></div><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="quiet" type="submit">Sign out</button></form></header><main>
 {{with .Message}}<p class="notice">{{.}}</p>{{end}}
 <section class="new-task"><h2>Add a task</h2><form method="post" action="/tasks"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Title<input name="title" required></label><label>Description<textarea name="description" rows="3"></textarea></label><label>Dependencies <span>(comma-separated IDs)</span><input name="dependencies"></label><button type="submit">Create task</button></form></section>
 <section><div class="section-heading"><h2>Tasks</h2><span>{{len .Tasks}} total</span></div><div class="task-list">
