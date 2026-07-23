@@ -213,7 +213,7 @@ func TestIndexRendersTasksAsKanbanBoard(t *testing.T) {
 	}
 }
 
-func TestCreateCompleteAndUploadImage(t *testing.T) {
+func TestCreateCompleteAndUploadFile(t *testing.T) {
 	t.Parallel()
 
 	handler, service := testHandler(t)
@@ -247,15 +247,16 @@ func TestCreateCompleteAndUploadImage(t *testing.T) {
 	if err := writer.WriteField("csrf", csrf); err != nil {
 		t.Fatalf("write csrf: %v", err)
 	}
-	file, err := writer.CreateFormFile("image", "pixel.png")
+	file, err := writer.CreateFormFile("file", "release-notes.pdf")
 	if err != nil {
-		t.Fatalf("create image form part: %v", err)
+		t.Fatalf("create file form part: %v", err)
 	}
-	if _, err := file.Write([]byte("\x89PNG\r\n\x1a\nimage")); err != nil {
-		t.Fatalf("write image: %v", err)
+	contents := []byte("%PDF-1.7\nrelease notes")
+	if _, err := file.Write(contents); err != nil {
+		t.Fatalf("write file: %v", err)
 	}
 	writer.Close()
-	uploadRequest := httptest.NewRequest(http.MethodPost, "/tasks/"+created.ID+"/images", &uploadBody)
+	uploadRequest := httptest.NewRequest(http.MethodPost, "/tasks/"+created.ID+"/attachments", &uploadBody)
 	uploadRequest.Header.Set("Content-Type", writer.FormDataContentType())
 	uploadRequest.AddCookie(cookie)
 	uploadResponse := httptest.NewRecorder()
@@ -263,9 +264,43 @@ func TestCreateCompleteAndUploadImage(t *testing.T) {
 	if uploadResponse.Code != http.StatusSeeOther {
 		t.Fatalf("upload status = %d; body: %s", uploadResponse.Code, uploadResponse.Body.String())
 	}
-	withImage, err := service.Get(context.Background(), created.ID)
-	if err != nil || len(withImage.Attachments) != 1 || withImage.Attachments[0].ContentType != "image/png" {
-		t.Fatalf("task after upload = %#v, %v", withImage, err)
+	withFile, err := service.Get(context.Background(), created.ID)
+	if err != nil || len(withFile.Attachments) != 1 {
+		t.Fatalf("task after upload = %#v, %v", withFile, err)
+	}
+	attachment := withFile.Attachments[0]
+	if attachment.Name != "release-notes.pdf" || attachment.ContentType != "application/pdf" {
+		t.Fatalf("attachment = %#v", attachment)
+	}
+
+	downloadRequest := httptest.NewRequest(http.MethodGet, "/attachments/"+attachment.Key, nil)
+	downloadRequest.AddCookie(cookie)
+	downloadResponse := httptest.NewRecorder()
+	handler.ServeHTTP(downloadResponse, downloadRequest)
+	if downloadResponse.Code != http.StatusOK {
+		t.Fatalf("download status = %d; body: %s", downloadResponse.Code, downloadResponse.Body.String())
+	}
+	if got := downloadResponse.Header().Get("Content-Type"); got != "application/pdf" {
+		t.Errorf("download content type = %q, want application/pdf", got)
+	}
+	if got := downloadResponse.Header().Get("Content-Disposition"); got != "attachment" {
+		t.Errorf("download content disposition = %q, want attachment", got)
+	}
+	if !bytes.Equal(downloadResponse.Body.Bytes(), contents) {
+		t.Errorf("download contents = %q, want %q", downloadResponse.Body.Bytes(), contents)
+	}
+
+	pageRequest := httptest.NewRequest(http.MethodGet, "/"+created.ID, nil)
+	pageRequest.AddCookie(cookie)
+	pageResponse := httptest.NewRecorder()
+	handler.ServeHTTP(pageResponse, pageRequest)
+	pageBody := pageResponse.Body.String()
+	if !strings.Contains(pageBody, `href="/attachments/`+attachment.Key+`"`) ||
+		!strings.Contains(pageBody, `download="release-notes.pdf"`) {
+		t.Errorf("task page does not render a downloadable file attachment; body: %s", pageBody)
+	}
+	if !strings.Contains(pageBody, "Attach a file") || strings.Contains(pageBody, `accept="image/*"`) {
+		t.Errorf("task page still restricts uploads to images; body: %s", pageBody)
 	}
 
 	complete := postForm(handler, "/tasks/"+created.ID+"/done", url.Values{"csrf": {csrf}}, cookie)
@@ -275,6 +310,45 @@ func TestCreateCompleteAndUploadImage(t *testing.T) {
 	completed, err := service.Get(context.Background(), created.ID)
 	if err != nil || completed.Status != task.StatusDone {
 		t.Fatalf("completed task = %#v, %v", completed, err)
+	}
+}
+
+func TestUploadAllowsFilesLargerThanTenMiB(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandler(t)
+	created, err := service.Create(context.Background(), task.CreateInput{Title: "Upload a large file"})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+
+	var uploadBody bytes.Buffer
+	writer := multipart.NewWriter(&uploadBody)
+	if err := writer.WriteField("csrf", csrf); err != nil {
+		t.Fatalf("write csrf: %v", err)
+	}
+	file, err := writer.CreateFormFile("file", "eleven-megabytes.bin")
+	if err != nil {
+		t.Fatalf("create file form part: %v", err)
+	}
+	oneMiB := make([]byte, 1<<20)
+	for range 11 {
+		if _, err := file.Write(oneMiB); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/tasks/"+created.ID+"/attachments", &uploadBody)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("upload status = %d; body: %s", response.Code, response.Body.String())
 	}
 }
 

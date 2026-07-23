@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /out/tasks ./cmd/tasks
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates wget && adduser -D -u 10001 app
 COPY --from=build /out/tasks /usr/local/bin/tasks
-# Only used for local image uploads; tasks live in PostgreSQL. Mount a volume
+# Only used for local file uploads; tasks live in PostgreSQL. Mount a volume
 # here (or use S3) when TASKS_OBJECT_STORE=local.
 RUN mkdir -p /data && chown app:app /data
 USER app

@@ -92,7 +92,7 @@ The first revision has a null `before_state`. Existing tasks receive a version-o
 
 The web UI uses one shared secret, so its revisions identify the web/shared-secret surface rather than an individual person. MCP revisions include the authenticated OAuth client ID. CLI revisions identify the local CLI but do not collect the operating-system username.
 
-Revision snapshots retain old task text and attachment metadata intentionally. They do not copy image bytes; preserving deleted or replaced image content requires object-store versioning or retention.
+Revision snapshots retain old task text and attachment metadata intentionally. They do not copy file bytes; preserving deleted or replaced file content requires object-store versioning or retention.
 
 OAuth clients, authorization codes, access and refresh tokens, and browser sessions are persisted in PostgreSQL. Secret token and session values are stored only as hashes, and authorized clients remain connected across server restarts.
 
@@ -134,7 +134,7 @@ TASKS_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres?ssl
   make test
 ```
 
-Tests cover the domain service, PostgreSQL persistence, read-only SQL enforcement, OAuth/PKCE, HTTP origin protection, MCP tools, CLI behavior, browser sessions, CSRF checks, and image uploads.
+Tests cover the domain service, PostgreSQL persistence, read-only SQL enforcement, OAuth/PKCE, HTTP origin protection, MCP tools, CLI behavior, browser sessions, CSRF checks, and file uploads.
 
 ## Releases and Homebrew
 
@@ -154,9 +154,9 @@ The release workflows use only the repository-scoped `GITHUB_TOKEN`; no package 
 
 ## Current boundaries
 
-- PostgreSQL is the source of truth for task and authentication state, so multiple instances can share it. Production instances must also share the configured S3-compatible image store; local image storage is single-instance only.
+- PostgreSQL is the source of truth for task and authentication state, so multiple instances can share it. Production instances must also share the configured S3-compatible object store; local file storage is single-instance only.
 - The shared secret grants full task access. There are not yet per-user identities or separate read/write grants.
 - Public deployments should add reverse-proxy request throttling for the login, registration, and authorization endpoints.
-- Attachments are images up to 10 MiB. Local storage is for development; production can use an existing S3-compatible bucket.
+- Attachments can be any file type up to 50 MiB. Local storage is for development; production can use an existing S3-compatible bucket.
 - Task revisions cover successful domain mutations, not reads, failed login attempts, or database-administrator activity. Deployments needing forensic change capture should stream PostgreSQL changes to an external immutable destination in addition to this application history.
 - The project does not yet declare an open-source license.

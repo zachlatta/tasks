@@ -41,9 +41,9 @@ type SessionStore interface {
 }
 
 const (
-	sessionCookie = "tasks_session"
-	sessionTTL    = 12 * time.Hour
-	maxImageSize  = 10 << 20
+	sessionCookie     = "tasks_session"
+	sessionTTL        = 12 * time.Hour
+	maxAttachmentSize = 50 << 20
 )
 
 //go:embed templates/*.html static/*.css
@@ -117,6 +117,7 @@ func New(config Config) http.Handler {
 		now:           config.Now,
 		templates: template.Must(template.New("").Funcs(template.FuncMap{
 			"renderMarkdown": renderMarkdown,
+			"isImage":        isImage,
 		}).ParseFS(assets, "templates/*.html")),
 		mux:      http.NewServeMux(),
 		sessions: config.Sessions,
@@ -129,8 +130,12 @@ func New(config Config) http.Handler {
 	h.mux.Handle("POST /tasks", h.requireSession(http.HandlerFunc(h.createTask)))
 	h.mux.Handle("POST /tasks/{id}/start", h.requireSession(http.HandlerFunc(h.startTask)))
 	h.mux.Handle("POST /tasks/{id}/done", h.requireSession(http.HandlerFunc(h.completeTask)))
-	h.mux.Handle("POST /tasks/{id}/images", h.requireSession(http.HandlerFunc(h.uploadImage)))
-	h.mux.Handle("GET /images/{key...}", h.requireSession(http.HandlerFunc(h.image)))
+	h.mux.Handle("POST /tasks/{id}/attachments", h.requireSession(http.HandlerFunc(h.uploadAttachment)))
+	h.mux.Handle("GET /attachments/{key...}", h.requireSession(http.HandlerFunc(h.attachment)))
+	// Keep the image routes working for pages loaded before attachments were
+	// generalized and for existing links.
+	h.mux.Handle("POST /tasks/{id}/images", h.requireSession(http.HandlerFunc(h.uploadAttachment)))
+	h.mux.Handle("GET /images/{key...}", h.requireSession(http.HandlerFunc(h.attachment)))
 	h.mux.Handle("GET /{id}", h.requireSession(http.HandlerFunc(h.task)))
 	return securityHeaders(h.mux)
 }
@@ -286,10 +291,10 @@ func newTaskCard(item task.Task, csrf string) taskCard {
 	return card
 }
 
-func (h *handler) uploadImage(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxImageSize+(1<<20))
-	if err := r.ParseMultipartForm(maxImageSize); err != nil {
-		http.Error(w, "invalid image upload", http.StatusBadRequest)
+func (h *handler) uploadAttachment(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAttachmentSize+(1<<20))
+	if err := r.ParseMultipartForm(maxAttachmentSize); err != nil {
+		http.Error(w, "invalid file upload", http.StatusBadRequest)
 		return
 	}
 	defer r.MultipartForm.RemoveAll()
@@ -297,31 +302,32 @@ func (h *handler) uploadImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid CSRF token", http.StatusForbidden)
 		return
 	}
-	file, fileHeader, err := r.FormFile("image")
+	file, fileHeader, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "image is required", http.StatusBadRequest)
-		return
+		// Accept the former field name so an upload from a page loaded before
+		// this change still succeeds.
+		file, fileHeader, err = r.FormFile("image")
+		if err != nil {
+			http.Error(w, "file is required", http.StatusBadRequest)
+			return
+		}
 	}
 	defer file.Close()
-	if fileHeader.Size <= 0 || fileHeader.Size > maxImageSize {
-		http.Error(w, "image must be between 1 byte and 10 MiB", http.StatusBadRequest)
+	if fileHeader.Size <= 0 || fileHeader.Size > maxAttachmentSize {
+		http.Error(w, "file must be between 1 byte and 50 MiB", http.StatusBadRequest)
 		return
 	}
 	leading := make([]byte, 512)
 	read, err := io.ReadFull(file, leading)
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
-		http.Error(w, "read image", http.StatusBadRequest)
+		http.Error(w, "read file", http.StatusBadRequest)
 		return
 	}
 	leading = leading[:read]
 	contentType := http.DetectContentType(leading)
-	if !strings.HasPrefix(contentType, "image/") {
-		http.Error(w, "only image uploads are supported", http.StatusUnsupportedMediaType)
-		return
-	}
 	name := filepath.Base(fileHeader.Filename)
 	if name == "." || name == "" {
-		name = "image"
+		name = "file"
 	}
 	extension := strings.ToLower(filepath.Ext(name))
 	if extension == "" {
@@ -331,9 +337,9 @@ func (h *handler) uploadImage(w http.ResponseWriter, r *http.Request) {
 	}
 	taskID := r.PathValue("id")
 	key := taskID + "/" + strings.ToLower(rand.Text()) + extension
-	contents := io.MultiReader(strings.NewReader(string(leading)), file)
+	contents := io.MultiReader(bytes.NewReader(leading), file)
 	if err := h.objects.Put(r.Context(), key, contents, fileHeader.Size, contentType); err != nil {
-		http.Error(w, "store image", http.StatusInternalServerError)
+		http.Error(w, "store file", http.StatusInternalServerError)
 		return
 	}
 	if _, err := h.tasks.AddAttachment(webMutationContext(r.Context()), taskID, task.Attachment{Key: key, Name: name, ContentType: contentType}); err != nil {
@@ -341,7 +347,7 @@ func (h *handler) uploadImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/?message=Image+uploaded", http.StatusSeeOther)
+	http.Redirect(w, r, "/?message=File+uploaded", http.StatusSeeOther)
 }
 
 func webMutationContext(ctx context.Context) context.Context {
@@ -351,17 +357,25 @@ func webMutationContext(ctx context.Context) context.Context {
 	})
 }
 
-func (h *handler) image(w http.ResponseWriter, r *http.Request) {
+func (h *handler) attachment(w http.ResponseWriter, r *http.Request) {
 	reader, contentType, err := h.objects.Open(r.Context(), r.PathValue("key"))
-	if err != nil || !strings.HasPrefix(contentType, "image/") {
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	defer reader.Close()
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", "inline")
+	disposition := "attachment"
+	if isImage(contentType) {
+		disposition = "inline"
+	}
+	w.Header().Set("Content-Disposition", disposition)
 	w.Header().Set("Cache-Control", "private, max-age=300")
 	_, _ = io.Copy(w, reader)
+}
+
+func isImage(contentType string) bool {
+	return strings.HasPrefix(contentType, "image/")
 }
 
 func (h *handler) requireSession(next http.Handler) http.Handler {

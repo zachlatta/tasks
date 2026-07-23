@@ -231,11 +231,23 @@ button.small { padding: .45rem .68rem; font-size: .78rem; white-space: nowrap; }
   background: #eeece5;
   border-radius: .3rem;
 }
-.images {
+.attachments {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr));
   gap: .55rem;
   margin-top: .85rem;
+}
+.file-attachment {
+  overflow: hidden;
+  padding: .65rem;
+  border: 1px solid #d6d2c8;
+  border-radius: .4rem;
+  background: #f4f1ea;
+  color: var(--primary);
+  font-size: .75rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 figure { min-width: 0; margin: 0; }
 figure img {
@@ -252,6 +264,7 @@ figcaption {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+figcaption a { color: inherit; }
 .attachment-panel { margin-top: .8rem; padding-top: .7rem; border-top: 1px solid #e0dcd2; }
 .attachment-panel summary {
   width: fit-content;

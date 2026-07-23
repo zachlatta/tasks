@@ -107,12 +107,15 @@
   </div>
   {{with .Description}}<div class="description">{{renderMarkdown .}}</div>{{end}}
   {{with .Dependencies}}<p class="dependencies"><strong>Depends on</strong>{{range .}}<a href="/{{.}}"><code>{{.}}</code></a>{{end}}</p>{{end}}
-  {{with .Attachments}}<div class="images">{{range .}}<figure><img src="/images/{{.Key}}" alt="{{.Name}}"><figcaption>{{.Name}}</figcaption></figure>{{end}}</div>{{end}}
+  {{with .Attachments}}<div class="attachments">{{range .}}
+    {{if isImage .ContentType}}<figure><img src="/attachments/{{.Key}}" alt="{{.Name}}"><figcaption><a href="/attachments/{{.Key}}" download="{{.Name}}">{{.Name}}</a></figcaption></figure>
+    {{else}}<a class="file-attachment" href="/attachments/{{.Key}}" download="{{.Name}}">{{.Name}}</a>{{end}}
+  {{end}}</div>{{end}}
   {{if ne .Status "done"}}<details class="attachment-panel">
-    <summary>Attach an image</summary>
-    <form class="upload" method="post" enctype="multipart/form-data" action="/tasks/{{.ID}}/images">
+    <summary>Attach a file</summary>
+    <form class="upload" method="post" enctype="multipart/form-data" action="/tasks/{{.ID}}/attachments">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <label>Image<input type="file" name="image" accept="image/*" required></label>
+      <label>File<input type="file" name="file" required></label>
       <button class="quiet small" type="submit">Upload</button>
     </form>
   </details>{{end}}
