@@ -46,10 +46,16 @@ type SessionStore interface {
 }
 
 const (
-	sessionCookie     = "tasks_session"
-	sessionTTL        = 12 * time.Hour
-	maxAttachmentSize = 50 << 20
-	excerptLimit      = 180
+	sessionCookie = "tasks_session"
+	// sessionCookieMaxAge bounds how long a browser remembers the login cookie.
+	// Server-side sessions never expire, so this only limits how long a client
+	// can be away before the shared secret must be re-entered. Browsers cap
+	// persistent cookies near 400 days regardless of a larger value, and
+	// requireSession slides the cookie forward on every page load, so an active
+	// client stays signed in indefinitely.
+	sessionCookieMaxAge = 400 * 24 * time.Hour
+	maxAttachmentSize   = 50 << 20
+	excerptLimit        = 180
 )
 
 //go:embed templates/*.html static/*.css static/*.js
@@ -219,23 +225,15 @@ func (h *handler) login(w http.ResponseWriter, r *http.Request) {
 		h.render(w, http.StatusUnauthorized, "login.html", pageData{Error: "That secret code is not valid."})
 		return
 	}
-	now := h.now()
 	token := rand.Text()
-	current := session{CSRF: rand.Text(), ExpiresAt: now.Add(sessionTTL)}
-	if err := h.sessions.SaveSession(r.Context(), hashToken(token), current.CSRF, current.ExpiresAt); err != nil {
+	csrf := rand.Text()
+	// A zero expiry marks the session as non-expiring: authenticated clients stay
+	// signed in until they log out.
+	if err := h.sessions.SaveSession(r.Context(), hashToken(token), csrf, time.Time{}); err != nil {
 		h.render(w, http.StatusInternalServerError, "login.html", pageData{Error: "Could not start a session. Please try again."})
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Value:    token,
-		Path:     "/",
-		Expires:  current.ExpiresAt,
-		MaxAge:   int(sessionTTL.Seconds()),
-		HttpOnly: true,
-		Secure:   h.secureCookies,
-		SameSite: http.SameSiteStrictMode,
-	})
+	h.setSessionCookie(w, token)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -249,6 +247,22 @@ func (h *handler) logout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Path: "/", MaxAge: -1, HttpOnly: true, Secure: h.secureCookies, SameSite: http.SameSiteStrictMode})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// setSessionCookie writes the persistent session cookie for token. It is used
+// both when a session is created and to slide the cookie forward on page loads,
+// so an active client is never dropped by the browser's cookie-lifetime cap.
+func (h *handler) setSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		Expires:  h.now().Add(sessionCookieMaxAge),
+		MaxAge:   int(sessionCookieMaxAge.Seconds()),
+		HttpOnly: true,
+		Secure:   h.secureCookies,
+		SameSite: http.SameSiteStrictMode,
+	})
 }
 
 func (h *handler) index(w http.ResponseWriter, r *http.Request) {
@@ -546,13 +560,21 @@ func (h *handler) requireSession(next http.Handler) http.Handler {
 			http.Error(w, "session lookup failed", http.StatusInternalServerError)
 			return
 		}
-		if ok && !h.now().Before(expiresAt) {
+		// A zero expiry never expires. A non-zero expiry belongs to a session
+		// issued before infinite sessions and is still honored so it ages out.
+		if ok && !expiresAt.IsZero() && !h.now().Before(expiresAt) {
 			_ = h.sessions.DeleteSession(r.Context(), hashToken(cookie.Value))
 			ok = false
 		}
 		if !ok {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
+		}
+		// Slide the browser cookie forward on page loads so an active client is
+		// never dropped by the browser's cookie-lifetime cap. Only GETs refresh
+		// it, which keeps logout (a POST) free to clear the cookie instead.
+		if r.Method == http.MethodGet {
+			h.setSessionCookie(w, cookie.Value)
 		}
 		current := session{CSRF: csrf, ExpiresAt: expiresAt}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionContextKey{}, current)))

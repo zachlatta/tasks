@@ -758,6 +758,26 @@ func TestSessionRoundTripAndDelete(t *testing.T) {
 	}
 }
 
+func TestSessionWithoutExpiryNeverExpires(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	// A zero expiry means the session never expires and is stored as NULL.
+	if err := store.SaveSession(ctx, "forever", "csrf-forever", time.Time{}); err != nil {
+		t.Fatalf("SaveSession: %v", err)
+	}
+	csrf, expiresAt, ok, err := store.Session(ctx, "forever")
+	if err != nil || !ok || csrf != "csrf-forever" || !expiresAt.IsZero() {
+		t.Fatalf("Session = %q %v %v %v", csrf, expiresAt, ok, err)
+	}
+	// Cleanup runs far in the future but must never remove a non-expiring session.
+	if err := store.DeleteExpiredAuthState(ctx, time.Date(2100, time.January, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("DeleteExpiredAuthState: %v", err)
+	}
+	if _, _, ok, _ := store.Session(ctx, "forever"); !ok {
+		t.Fatal("non-expiring session was removed by cleanup")
+	}
+}
+
 func TestDeleteExpiredAuthState(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()

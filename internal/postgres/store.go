@@ -170,8 +170,11 @@ CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
 CREATE TABLE IF NOT EXISTS web_sessions (
 	token_hash TEXT PRIMARY KEY,
 	csrf TEXT NOT NULL,
-	expires_at TIMESTAMPTZ NOT NULL
+	expires_at TIMESTAMPTZ
 );
+-- Browser sessions no longer expire on their own; a NULL expiry marks a
+-- non-expiring session. Relax the constraint on databases created earlier.
+ALTER TABLE web_sessions ALTER COLUMN expires_at DROP NOT NULL;
 CREATE INDEX IF NOT EXISTS oauth_codes_expires_idx ON oauth_codes(expires_at);
 CREATE INDEX IF NOT EXISTS oauth_tokens_expires_idx ON oauth_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS oauth_refresh_tokens_expires_idx ON oauth_refresh_tokens(expires_at);
@@ -776,18 +779,25 @@ func (s *Store) RefreshToken(ctx context.Context, tokenHash string) (auth.Token,
 // SaveSession persists a browser session keyed by its hash. It implements
 // web.SessionStore.
 func (s *Store) SaveSession(ctx context.Context, tokenHash, csrf string, expiresAt time.Time) error {
+	// A zero expiry means the session never expires; store it as SQL NULL.
+	var expiry any
+	if !expiresAt.IsZero() {
+		expiry = expiresAt
+	}
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO web_sessions (token_hash, csrf, expires_at)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (token_hash) DO UPDATE SET csrf = EXCLUDED.csrf, expires_at = EXCLUDED.expires_at
-	`, tokenHash, csrf, expiresAt)
+	`, tokenHash, csrf, expiry)
 	return err
 }
 
 // Session loads a browser session by its hash. It implements web.SessionStore.
 func (s *Store) Session(ctx context.Context, tokenHash string) (string, time.Time, bool, error) {
 	var csrf string
-	var expiresAt time.Time
+	// A NULL expiry marks a non-expiring session and scans into a nil pointer,
+	// which the web layer reads as a zero time.
+	var expiresAt *time.Time
 	err := s.pool.QueryRow(ctx, `
 		SELECT csrf, expires_at FROM web_sessions WHERE token_hash = $1
 	`, tokenHash).Scan(&csrf, &expiresAt)
@@ -796,6 +806,9 @@ func (s *Store) Session(ctx context.Context, tokenHash string) (string, time.Tim
 	}
 	if err != nil {
 		return "", time.Time{}, false, err
+	}
+	if expiresAt == nil {
+		return csrf, time.Time{}, true, nil
 	}
 	return csrf, expiresAt.UTC(), true, nil
 }
@@ -814,7 +827,8 @@ func (s *Store) DeleteExpiredAuthState(ctx context.Context, now time.Time) error
 		`DELETE FROM oauth_codes WHERE expires_at < $1`,
 		`DELETE FROM oauth_tokens WHERE expires_at < $1`,
 		`DELETE FROM oauth_refresh_tokens WHERE expires_at < $1`,
-		`DELETE FROM web_sessions WHERE expires_at < $1`,
+		// Non-expiring sessions store a NULL expiry and must survive cleanup.
+		`DELETE FROM web_sessions WHERE expires_at IS NOT NULL AND expires_at < $1`,
 	} {
 		if _, err := s.pool.Exec(ctx, statement, now); err != nil {
 			return err

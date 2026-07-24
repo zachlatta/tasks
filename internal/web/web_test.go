@@ -64,6 +64,125 @@ func TestLoginProtectsTaskPage(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedSessionNeverExpires(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	root := t.TempDir()
+	repo := tasktest.NewRepository()
+	service := task.NewService(repo, clock, func() string { return "durable-id" })
+	handler := New(Config{
+		Tasks:   service,
+		Reader:  repo,
+		Objects: objectstore.NewLocal(filepath.Join(root, "objects")),
+		Auth:    auth.NewServer(auth.Config{Issuer: "http://tasks.example.com", Secret: "shared-secret"}),
+		Now:     func() time.Time { return clock() },
+	})
+
+	response := postForm(handler, "/login", url.Values{"secret": {"shared-secret"}}, nil)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("login status = %d; body: %s", response.Code, response.Body.String())
+	}
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login cookies = %#v", cookies)
+	}
+	cookie := cookies[0]
+	// The login cookie must persist across browser restarts, not expire when the
+	// browser closes.
+	if cookie.MaxAge <= 0 {
+		t.Fatalf("session cookie is not persistent: MaxAge = %d", cookie.MaxAge)
+	}
+
+	// A decade later, with no activity in between, the session is still valid.
+	now = now.AddDate(10, 0, 0)
+	page := get(t, handler, "/", cookie)
+	if page.Code != http.StatusOK {
+		t.Fatalf("session expired for an authed client: status = %d, location = %q", page.Code, page.Header().Get("Location"))
+	}
+	// Loading a page slides the cookie forward so an active client is never
+	// dropped by the browser's cookie-lifetime cap.
+	var refreshed *http.Cookie
+	for _, c := range page.Result().Cookies() {
+		if c.Name == sessionCookie {
+			refreshed = c
+		}
+	}
+	if refreshed == nil || refreshed.MaxAge <= 0 || refreshed.Value != cookie.Value {
+		t.Fatalf("page load did not slide the session cookie forward: %#v", refreshed)
+	}
+}
+
+func TestLegacySessionWithExpiryStillExpires(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	repo := tasktest.NewRepository()
+	service := task.NewService(repo, func() time.Time { return now }, func() string { return "legacy-id" })
+	sessions := newMemorySessionStore()
+	// A session issued before infinite sessions carries a real expiry that has
+	// already passed; it must not authenticate.
+	if err := sessions.SaveSession(context.Background(), hashToken("legacy-token"), "csrf", now.Add(-time.Minute)); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+	handler := New(Config{
+		Tasks:    service,
+		Reader:   repo,
+		Objects:  objectstore.NewLocal(filepath.Join(root, "objects")),
+		Auth:     auth.NewServer(auth.Config{Issuer: "http://tasks.example.com", Secret: "shared-secret"}),
+		Now:      func() time.Time { return now },
+		Sessions: sessions,
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookie, Value: "legacy-token"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/login" {
+		t.Fatalf("expired legacy session still authenticates: status = %d, location = %q", response.Code, response.Header().Get("Location"))
+	}
+}
+
+func TestLogoutEndsSession(t *testing.T) {
+	t.Parallel()
+
+	handler, _ := testHandler(t)
+	cookie, csrf := login(t, handler)
+
+	logout := postForm(handler, "/logout", url.Values{"csrf": {csrf}}, cookie)
+	if logout.Code != http.StatusSeeOther || logout.Header().Get("Location") != "/login" {
+		t.Fatalf("logout response = %d %q", logout.Code, logout.Header().Get("Location"))
+	}
+	var cleared *http.Cookie
+	for _, c := range logout.Result().Cookies() {
+		if c.Name == sessionCookie {
+			cleared = c
+		}
+	}
+	if cleared == nil || cleared.MaxAge >= 0 {
+		t.Fatalf("logout did not clear the session cookie: %#v", cleared)
+	}
+	// The server-side session is gone, so the old cookie no longer authenticates.
+	page := get(t, handler, "/", cookie)
+	if page.Code != http.StatusSeeOther || page.Header().Get("Location") != "/login" {
+		t.Fatalf("session still valid after logout: status = %d, location = %q", page.Code, page.Header().Get("Location"))
+	}
+}
+
+func TestBoardShowsLogoutButton(t *testing.T) {
+	t.Parallel()
+
+	handler, _ := testHandler(t)
+	cookie, _ := login(t, handler)
+
+	body := get(t, handler, "/", cookie).Body.String()
+	if !strings.Contains(body, `action="/logout"`) || !strings.Contains(body, "Sign out") {
+		t.Fatalf("board is missing a logout button; body: %s", body)
+	}
+}
+
 func TestTaskDescriptionsRenderSafeMarkdown(t *testing.T) {
 	t.Parallel()
 
