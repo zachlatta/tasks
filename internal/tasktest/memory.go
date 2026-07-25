@@ -63,13 +63,19 @@ func (r *Repository) List(_ context.Context) ([]task.Task, error) {
 	return items, nil
 }
 
-// Tasks returns every task ordered by workflow state, then by board position
-// with newest-first as the tiebreak, mirroring the fixed projection the web UI
-// reads through in production.
+// Tasks returns every live task ordered by workflow state, then by board
+// position with newest-first as the tiebreak, mirroring the fixed projection the
+// web UI reads through in production. Soft-deleted tasks are left off the board.
 func (r *Repository) Tasks(ctx context.Context) ([]task.Task, error) {
-	items, err := r.List(ctx)
+	stored, err := r.List(ctx)
 	if err != nil {
 		return nil, err
+	}
+	items := make([]task.Task, 0, len(stored))
+	for _, item := range stored {
+		if !item.Deleted() {
+			items = append(items, item)
+		}
 	}
 	sort.SliceStable(items, func(i, j int) bool {
 		if items[i].Status != items[j].Status {
@@ -80,6 +86,28 @@ func (r *Repository) Tasks(ctx context.Context) ([]task.Task, error) {
 		}
 		if !items[i].CreatedAt.Equal(items[j].CreatedAt) {
 			return items[i].CreatedAt.After(items[j].CreatedAt)
+		}
+		return items[i].ID < items[j].ID
+	})
+	return items, nil
+}
+
+// DeletedTasks returns the soft-deleted tasks, most recently deleted first,
+// mirroring the store's own deleted-task projection.
+func (r *Repository) DeletedTasks(ctx context.Context) ([]task.Task, error) {
+	stored, err := r.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]task.Task, 0, len(stored))
+	for _, item := range stored {
+		if item.Deleted() {
+			items = append(items, item)
+		}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if !items[i].DeletedAt.Equal(*items[j].DeletedAt) {
+			return items[i].DeletedAt.After(*items[j].DeletedAt)
 		}
 		return items[i].ID < items[j].ID
 	})
@@ -102,5 +130,9 @@ func statusOrder(status task.Status) int {
 func clone(item task.Task) task.Task {
 	item.Dependencies = slices.Clone(item.Dependencies)
 	item.Attachments = slices.Clone(item.Attachments)
+	if item.DeletedAt != nil {
+		deletedAt := *item.DeletedAt
+		item.DeletedAt = &deletedAt
+	}
 	return item
 }

@@ -28,6 +28,10 @@ func NewHandler(tools *Tools) http.Handler {
 			invokeMutation(w, r, tools.UpdateTask)
 		case CompleteTaskTool:
 			invokeMutation(w, r, tools.CompleteTask)
+		case DeleteTaskTool:
+			invokeMutation(w, r, tools.DeleteTask)
+		case RestoreTaskTool:
+			invokeMutation(w, r, tools.RestoreTask)
 		default:
 			writeError(w, http.StatusNotFound, "tool_not_found", "no task tool named "+r.PathValue("name"))
 		}

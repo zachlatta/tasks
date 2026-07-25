@@ -43,10 +43,14 @@ CREATE TABLE IF NOT EXISTS tasks (
 	created_at TIMESTAMPTZ NOT NULL,
 	updated_at TIMESTAMPTZ NOT NULL,
 	version BIGINT NOT NULL DEFAULT 1,
-	position DOUBLE PRECISION NOT NULL DEFAULT 0
+	position DOUBLE PRECISION NOT NULL DEFAULT 0,
+	deleted_at TIMESTAMPTZ
 );
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS position DOUBLE PRECISION NOT NULL DEFAULT 0;
+-- Soft delete: a deleted task keeps its row and its whole revision history, and
+-- a NULL deleted_at marks a task that is still on the board.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 -- Tasks stored before the board could be reordered by hand all share position
 -- zero. Spread them out once, keeping the newest-first order they were shown in.
 DO $$
@@ -104,6 +108,7 @@ CREATE TABLE IF NOT EXISTS task_revisions (
 	UNIQUE (task_id, version)
 );
 CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status);
+CREATE INDEX IF NOT EXISTS tasks_deleted_at_idx ON tasks(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS dependencies_depends_on_idx ON dependencies(depends_on_id);
 CREATE INDEX IF NOT EXISTS task_revisions_occurred_at_idx ON task_revisions(occurred_at, revision_id);
 CREATE OR REPLACE FUNCTION reject_task_revision_mutation()
@@ -137,7 +142,8 @@ SELECT
 	(SELECT count(*) FROM images i WHERE i.task_id = t.id) AS image_count,
 	t.version,
 	t.position
-FROM tasks t;
+FROM tasks t
+WHERE t.deleted_at IS NULL;
 CREATE TABLE IF NOT EXISTS oauth_clients (
 	id TEXT PRIMARY KEY,
 	name TEXT NOT NULL,
@@ -215,6 +221,10 @@ func (s *Store) SetMaxRows(maximum int) {
 	}
 }
 
+// taskColumns is the stored task projection every read shares, in the order
+// scanTask expects.
+const taskColumns = `id, title, description, status, position, created_at, updated_at, version, deleted_at`
+
 // Create inserts a new task and its dependencies and images atomically.
 func (s *Store) Create(ctx context.Context, item task.Task) error {
 	if item.Version == 0 {
@@ -225,9 +235,9 @@ func (s *Store) Create(ctx context.Context, item task.Task) error {
 	}
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO tasks (id, title, description, status, position, created_at, updated_at, version)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		`, item.ID, item.Title, item.Description, string(item.Status), item.Position, item.CreatedAt, item.UpdatedAt, item.Version)
+			INSERT INTO tasks (id, title, description, status, position, created_at, updated_at, version, deleted_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`, item.ID, item.Title, item.Description, string(item.Status), item.Position, item.CreatedAt, item.UpdatedAt, item.Version, item.DeletedAt)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return task.ErrAlreadyExists
@@ -255,9 +265,9 @@ func (s *Store) Update(ctx context.Context, item task.Task) error {
 		}
 		tag, err := tx.Exec(ctx, `
 			UPDATE tasks
-			SET title = $2, description = $3, status = $4, position = $5, updated_at = $6, version = $7
-			WHERE id = $1 AND version = $8
-		`, item.ID, item.Title, item.Description, string(item.Status), item.Position, item.UpdatedAt, item.Version, before.Version)
+			SET title = $2, description = $3, status = $4, position = $5, updated_at = $6, version = $7, deleted_at = $8
+			WHERE id = $1 AND version = $9
+		`, item.ID, item.Title, item.Description, string(item.Status), item.Position, item.UpdatedAt, item.Version, item.DeletedAt, before.Version)
 		if err != nil {
 			return err
 		}
@@ -277,24 +287,17 @@ func (s *Store) Update(ctx context.Context, item task.Task) error {
 	})
 }
 
-// Get loads a task by ID, including its dependencies and images. It reports
-// task.ErrNotFound when the task does not exist.
+// Get loads a task by ID, including its dependencies and images. Soft-deleted
+// tasks are included, so the service can restore them; it is the service that
+// hides them from every other operation. Get reports task.ErrNotFound when the
+// task does not exist.
 func (s *Store) Get(ctx context.Context, id string) (task.Task, error) {
-	var item task.Task
-	var status string
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, title, description, status, position, created_at, updated_at, version
-		FROM tasks WHERE id = $1
-	`, id).Scan(&item.ID, &item.Title, &item.Description, &status, &item.Position, &item.CreatedAt, &item.UpdatedAt, &item.Version)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return task.Task{}, task.ErrNotFound
-	}
+	item, err := scanTask(s.pool.QueryRow(ctx, `
+		SELECT `+taskColumns+` FROM tasks WHERE id = $1
+	`, id))
 	if err != nil {
 		return task.Task{}, err
 	}
-	item.Status = task.Status(status)
-	item.CreatedAt = item.CreatedAt.UTC()
-	item.UpdatedAt = item.UpdatedAt.UTC()
 	items := []task.Task{item}
 	if err := s.attachChildren(ctx, items, map[string]int{id: 0}); err != nil {
 		return task.Task{}, err
@@ -302,25 +305,36 @@ func (s *Store) Get(ctx context.Context, id string) (task.Task, error) {
 	return items[0], nil
 }
 
-// List returns every task with its dependencies and images. Ordering of the
-// tasks themselves is left to the caller.
+// List returns every task, deleted ones included, with its dependencies and
+// images. Ordering of the tasks themselves is left to the caller.
 func (s *Store) List(ctx context.Context) ([]task.Task, error) {
-	return s.projection(ctx, `
-		SELECT id, title, description, status, position, created_at, updated_at, version FROM tasks
-	`)
+	return s.projection(ctx, `SELECT `+taskColumns+` FROM tasks`)
 }
 
-// Tasks returns every task ordered by workflow state then newest-first,
-// matching the fixed projection the web UI renders.
+// Tasks returns every live task ordered by workflow state then newest-first,
+// matching the fixed projection the web UI renders. Soft-deleted tasks are left
+// off the board.
 func (s *Store) Tasks(ctx context.Context) ([]task.Task, error) {
 	return s.projection(ctx, `
-		SELECT id, title, description, status, position, created_at, updated_at, version
+		SELECT `+taskColumns+`
 		FROM tasks
+		WHERE deleted_at IS NULL
 		ORDER BY
 			CASE status WHEN 'todo' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
 			position,
 			created_at DESC,
 			id
+	`)
+}
+
+// DeletedTasks returns the soft-deleted tasks, most recently deleted first, for
+// the web UI's list of deleted tasks.
+func (s *Store) DeletedTasks(ctx context.Context) ([]task.Task, error) {
+	return s.projection(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE deleted_at IS NOT NULL
+		ORDER BY deleted_at DESC, id
 	`)
 }
 
@@ -333,14 +347,10 @@ func (s *Store) projection(ctx context.Context, taskQuery string) ([]task.Task, 
 	items := make([]task.Task, 0)
 	index := make(map[string]int)
 	for rows.Next() {
-		var item task.Task
-		var status string
-		if err := rows.Scan(&item.ID, &item.Title, &item.Description, &status, &item.Position, &item.CreatedAt, &item.UpdatedAt, &item.Version); err != nil {
+		item, err := scanTask(rows)
+		if err != nil {
 			return nil, err
 		}
-		item.Status = task.Status(status)
-		item.CreatedAt = item.CreatedAt.UTC()
-		item.UpdatedAt = item.UpdatedAt.UTC()
 		index[item.ID] = len(items)
 		items = append(items, item)
 	}
@@ -538,22 +548,14 @@ func insertChildren(ctx context.Context, tx pgx.Tx, item task.Task) error {
 }
 
 func taskForUpdate(ctx context.Context, tx pgx.Tx, id string) (task.Task, error) {
-	var item task.Task
-	var status string
-	err := tx.QueryRow(ctx, `
-		SELECT id, title, description, status, position, created_at, updated_at, version
+	item, err := scanTask(tx.QueryRow(ctx, `
+		SELECT `+taskColumns+`
 		FROM tasks WHERE id = $1
 		FOR UPDATE
-	`, id).Scan(&item.ID, &item.Title, &item.Description, &status, &item.Position, &item.CreatedAt, &item.UpdatedAt, &item.Version)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return task.Task{}, task.ErrNotFound
-	}
+	`, id))
 	if err != nil {
 		return task.Task{}, err
 	}
-	item.Status = task.Status(status)
-	item.CreatedAt = item.CreatedAt.UTC()
-	item.UpdatedAt = item.UpdatedAt.UTC()
 
 	dependencyRows, err := tx.Query(ctx, `
 		SELECT depends_on_id FROM dependencies
@@ -595,6 +597,31 @@ func taskForUpdate(ctx context.Context, tx pgx.Tx, id string) (task.Task, error)
 	}
 	if err := imageRows.Err(); err != nil {
 		return task.Task{}, err
+	}
+	return item, nil
+}
+
+// scanTask reads one row of taskColumns, normalizing timestamps to UTC. It
+// reports task.ErrNotFound for a missing single-row read.
+func scanTask(row pgx.Row) (task.Task, error) {
+	var item task.Task
+	var status string
+	err := row.Scan(
+		&item.ID, &item.Title, &item.Description, &status, &item.Position,
+		&item.CreatedAt, &item.UpdatedAt, &item.Version, &item.DeletedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return task.Task{}, task.ErrNotFound
+	}
+	if err != nil {
+		return task.Task{}, err
+	}
+	item.Status = task.Status(status)
+	item.CreatedAt = item.CreatedAt.UTC()
+	item.UpdatedAt = item.UpdatedAt.UTC()
+	if item.DeletedAt != nil {
+		deletedAt := item.DeletedAt.UTC()
+		item.DeletedAt = &deletedAt
 	}
 	return item, nil
 }

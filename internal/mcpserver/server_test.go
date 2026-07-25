@@ -50,7 +50,7 @@ func TestServerIdentity(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 	slices.Sort(names)
-	wantNames := []string{"complete_task", "create_task", "edit_task_text", "query_tasks_sql", "update_task"}
+	wantNames := []string{"complete_task", "create_task", "delete_task", "edit_task_text", "query_tasks_sql", "restore_task", "update_task"}
 	if !slices.Equal(names, wantNames) {
 		t.Fatalf("tool names = %v, want %v", names, wantNames)
 	}
@@ -136,6 +136,64 @@ func TestToolsUpdateAndEditTaskTextWithoutPostgres(t *testing.T) {
 	}
 }
 
+func TestDeleteAndRestoreToolsSoftDeleteTasks(t *testing.T) {
+	t.Parallel()
+
+	repository := tasktest.NewRepository()
+	service := task.NewService(repository, time.Now, func() string { return "disposable" })
+	server := New(service, emptyReader{}, "test")
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = server.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "create_task", Arguments: map[string]any{
+		"title": "Disposable",
+	}}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	deleted, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "delete_task", Arguments: map[string]any{
+		"id": "disposable",
+	}})
+	if err != nil || deleted.IsError {
+		t.Fatalf("delete task = %#v, %v", deleted, err)
+	}
+	if _, err := service.Get(ctx, "disposable"); err == nil {
+		t.Fatal("deleted task is still readable, want it hidden")
+	}
+
+	// A deleted task can no longer be edited, only restored.
+	edited, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "update_task", Arguments: map[string]any{
+		"id": "disposable", "title": "Renamed while deleted",
+	}})
+	if err != nil {
+		t.Fatalf("call update on a deleted task: %v", err)
+	}
+	if !edited.IsError {
+		t.Fatal("editing a deleted task succeeded, want tool error")
+	}
+
+	restored, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "restore_task", Arguments: map[string]any{
+		"id": "disposable",
+	}})
+	if err != nil || restored.IsError {
+		t.Fatalf("restore task = %#v, %v", restored, err)
+	}
+	item, err := service.Get(ctx, "disposable")
+	if err != nil {
+		t.Fatalf("get restored task: %v", err)
+	}
+	if item.Title != "Disposable" || item.Deleted() {
+		t.Fatalf("restored task = %#v", item)
+	}
+}
+
 func TestToolsCreateQueryAndCompleteTasks(t *testing.T) {
 	t.Parallel()
 
@@ -172,7 +230,7 @@ func TestToolsCreateQueryAndCompleteTasks(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 	slices.Sort(names)
-	wantNames := []string{"complete_task", "create_task", "edit_task_text", "query_tasks_sql", "update_task"}
+	wantNames := []string{"complete_task", "create_task", "delete_task", "edit_task_text", "query_tasks_sql", "restore_task", "update_task"}
 	if !slices.Equal(names, wantNames) {
 		t.Fatalf("tool names = %v, want %v", names, wantNames)
 	}

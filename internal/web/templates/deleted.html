@@ -1,0 +1,42 @@
+{{define "deleted.html"}}<!doctype html>
+<html lang="en">
+{{template "document-head" "Deleted"}}
+<body class="deleted-page" data-csrf="{{.CSRF}}">
+  {{template "site-header" .}}
+  <main>
+    {{with .Message}}<p class="notice" role="status">{{.}}</p>{{end}}
+    <p class="crumbs"><a class="back-link" href="/">All tasks</a></p>
+
+    <div class="board-bar">
+      <div class="board-bar-title">
+        <p class="eyebrow">SET ASIDE</p>
+        <h2 id="deleted-heading">Deleted tasks</h2>
+      </div>
+      <p class="board-hint">Deleting is reversible. A deleted task keeps its text, files, history, and its place on the board until it is restored.</p>
+    </div>
+
+    {{if .Deleted}}
+    <ul class="deleted-list" aria-labelledby="deleted-heading">
+      {{range .Deleted}}<li class="deleted-item">
+        <div class="deleted-summary">
+          <p class="deleted-title">{{renderInlineMarkdown .Title}}</p>
+          {{with .Excerpt}}<p class="card-excerpt">{{.}}</p>{{end}}
+          <p class="deleted-meta">
+            <code class="task-id">{{.ID}}</code>
+            <span class="chip">{{.StatusLabel}}</span>
+            <time datetime="{{.DeletedTimestamp}}">deleted {{.DeletedRelative}}</time>
+          </p>
+        </div>
+        <form method="post" action="/tasks/{{.ID}}/restore">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button class="quiet small" type="submit">Restore</button>
+        </form>
+      </li>{{end}}
+    </ul>
+    {{else}}<p class="detail-empty">Nothing has been deleted.</p>{{end}}
+  </main>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>{{end}}

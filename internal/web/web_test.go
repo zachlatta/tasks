@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -955,6 +956,195 @@ func TestTaskMutationsCarryWebAuditAttribution(t *testing.T) {
 			t.Fatalf("mutation %d attribution = %#v", index, mutation)
 		}
 	}
+}
+
+func TestDeleteTakesTaskOffTheBoardAndRestorePutsItBack(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "disposable")
+	if _, err := service.Create(context.Background(), task.CreateInput{
+		Title: "Disposable task", Description: "Not needed after all",
+	}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+
+	deleted := postForm(handler, "/tasks/disposable/delete", url.Values{"csrf": {csrf}}, cookie)
+	if deleted.Code != http.StatusSeeOther || !strings.HasPrefix(deleted.Header().Get("Location"), "/?message=") {
+		t.Fatalf("delete response = %d %q", deleted.Code, deleted.Header().Get("Location"))
+	}
+	board := get(t, handler, "/", cookie).Body.String()
+	if strings.Contains(board, "Disposable task") || strings.Contains(board, `data-task-id="disposable"`) {
+		t.Fatalf("deleted task is still on the board; body: %s", board)
+	}
+	if detail := get(t, handler, "/disposable", cookie); detail.Code != http.StatusNotFound {
+		t.Fatalf("deleted task detail status = %d, want 404", detail.Code)
+	}
+
+	// The deleted list is where a soft-deleted task can be found and restored.
+	trash := get(t, handler, "/deleted", cookie)
+	if trash.Code != http.StatusOK {
+		t.Fatalf("deleted page status = %d; body: %s", trash.Code, trash.Body.String())
+	}
+	if !strings.Contains(trash.Body.String(), "Disposable task") ||
+		!strings.Contains(trash.Body.String(), `action="/tasks/disposable/restore"`) {
+		t.Fatalf("deleted page is missing the task or its restore control; body: %s", trash.Body.String())
+	}
+
+	restored := postForm(handler, "/tasks/disposable/restore", url.Values{"csrf": {csrf}}, cookie)
+	if restored.Code != http.StatusSeeOther || !strings.HasPrefix(restored.Header().Get("Location"), "/deleted?message=") {
+		t.Fatalf("restore response = %d %q", restored.Code, restored.Header().Get("Location"))
+	}
+	board = get(t, handler, "/", cookie).Body.String()
+	if !strings.Contains(board, "Disposable task") {
+		t.Fatalf("restored task is missing from the board; body: %s", board)
+	}
+	if empty := get(t, handler, "/deleted", cookie).Body.String(); strings.Contains(empty, "Disposable task") {
+		t.Fatalf("restored task is still listed as deleted; body: %s", empty)
+	}
+}
+
+func TestBoardDeleteAndRestoreAnswerWithJSON(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "undo-me", "neighbor")
+	for _, title := range []string{"Undo me", "Neighbor"} {
+		if _, err := service.Create(context.Background(), task.CreateInput{Title: title}); err != nil {
+			t.Fatalf("create %q: %v", title, err)
+		}
+	}
+	// The column reads neighbor, undo-me; a restore must land back at index 1.
+	cookie, csrf := login(t, handler)
+
+	deleteResponse := postJSONForm(t, handler, "/tasks/undo-me/delete", url.Values{"csrf": {csrf}}, cookie)
+	if deleteResponse.Code != http.StatusOK {
+		t.Fatalf("json delete status = %d; body: %s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	var deleted struct {
+		ID      string `json:"id"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(deleteResponse.Body.Bytes(), &deleted); err != nil {
+		t.Fatalf("decode json delete response: %v; body: %s", err, deleteResponse.Body.String())
+	}
+	if deleted.ID != "undo-me" || deleted.Message == "" {
+		t.Fatalf("json delete payload = %#v", deleted)
+	}
+
+	restoreResponse := postJSONForm(t, handler, "/tasks/undo-me/restore", url.Values{"csrf": {csrf}}, cookie)
+	if restoreResponse.Code != http.StatusOK {
+		t.Fatalf("json restore status = %d; body: %s", restoreResponse.Code, restoreResponse.Body.String())
+	}
+	var restored struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+		Card   string `json:"card"`
+		Index  int    `json:"index"`
+	}
+	if err := json.Unmarshal(restoreResponse.Body.Bytes(), &restored); err != nil {
+		t.Fatalf("decode json restore response: %v; body: %s", err, restoreResponse.Body.String())
+	}
+	if restored.ID != "undo-me" || restored.Status != string(task.StatusTodo) || restored.Index != 1 {
+		t.Fatalf("json restore payload = %#v", restored)
+	}
+	// The board reinserts the server's own card markup rather than rebuilding it.
+	if !strings.Contains(restored.Card, `data-task-id="undo-me"`) || !strings.Contains(restored.Card, "Undo me") {
+		t.Fatalf("json restore card = %q", restored.Card)
+	}
+}
+
+func TestDeleteRefusesTaskOtherTasksDependOn(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "prerequisite", "dependent")
+	if _, err := service.Create(context.Background(), task.CreateInput{Title: "Prerequisite"}); err != nil {
+		t.Fatalf("create prerequisite: %v", err)
+	}
+	if _, err := service.Create(context.Background(), task.CreateInput{
+		Title: "Dependent", Dependencies: []string{"prerequisite"},
+	}); err != nil {
+		t.Fatalf("create dependent: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+
+	refused := postJSONForm(t, handler, "/tasks/prerequisite/delete", url.Values{"csrf": {csrf}}, cookie)
+	if refused.Code != http.StatusConflict {
+		t.Fatalf("delete with dependents status = %d, want 409; body: %s", refused.Code, refused.Body.String())
+	}
+	if !strings.Contains(refused.Body.String(), "dependent") {
+		t.Fatalf("delete refusal does not name the dependent task: %s", refused.Body.String())
+	}
+	if _, err := service.Get(context.Background(), "prerequisite"); err != nil {
+		t.Fatalf("refused delete removed the task anyway: %v", err)
+	}
+}
+
+func TestDeleteAndRestoreRequireCSRF(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "guarded")
+	if _, err := service.Create(context.Background(), task.CreateInput{Title: "Guarded"}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+
+	if forged := postForm(handler, "/tasks/guarded/delete", url.Values{}, cookie); forged.Code != http.StatusForbidden {
+		t.Fatalf("delete without CSRF status = %d, want 403", forged.Code)
+	}
+	if _, err := service.Get(context.Background(), "guarded"); err != nil {
+		t.Fatalf("task deleted without a CSRF token: %v", err)
+	}
+	if deleted := postForm(handler, "/tasks/guarded/delete", url.Values{"csrf": {csrf}}, cookie); deleted.Code != http.StatusSeeOther {
+		t.Fatalf("delete status = %d; body: %s", deleted.Code, deleted.Body.String())
+	}
+	if forged := postForm(handler, "/tasks/guarded/restore", url.Values{}, cookie); forged.Code != http.StatusForbidden {
+		t.Fatalf("restore without CSRF status = %d, want 403", forged.Code)
+	}
+	if _, err := service.Get(context.Background(), "guarded"); !errors.Is(err, task.ErrNotFound) {
+		t.Fatalf("task restored without a CSRF token: %v", err)
+	}
+}
+
+func TestTaskDetailOffersDeleteAndBoardLinksDeletedTasks(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "removable")
+	if _, err := service.Create(context.Background(), task.CreateInput{Title: "Removable"}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+
+	detail := get(t, handler, "/removable", cookie).Body.String()
+	if !strings.Contains(detail, `action="/tasks/removable/delete"`) || !strings.Contains(detail, "Delete task") {
+		t.Fatalf("task detail is missing a delete control; body: %s", detail)
+	}
+	// With nothing deleted, the board stays free of a deleted-tasks link.
+	if board := get(t, handler, "/", cookie).Body.String(); strings.Contains(board, `href="/deleted"`) {
+		t.Fatalf("board links to deleted tasks with none deleted; body: %s", board)
+	}
+	if deleted := postForm(handler, "/tasks/removable/delete", url.Values{"csrf": {csrf}}, cookie); deleted.Code != http.StatusSeeOther {
+		t.Fatalf("delete status = %d; body: %s", deleted.Code, deleted.Body.String())
+	}
+	board := get(t, handler, "/", cookie).Body.String()
+	if !strings.Contains(board, `href="/deleted"`) || !strings.Contains(board, "1 deleted") {
+		t.Fatalf("board does not link to the deleted task; body: %s", board)
+	}
+}
+
+func postJSONForm(t *testing.T, handler http.Handler, target string, values url.Values, cookie *http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, target, strings.NewReader(values.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Accept", "application/json")
+	if cookie != nil {
+		request.AddCookie(cookie)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if contentType := response.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+		t.Fatalf("%s content type = %q, want JSON", target, contentType)
+	}
+	return response
 }
 
 type auditCapturingRepository struct {

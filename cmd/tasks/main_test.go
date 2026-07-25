@@ -149,6 +149,76 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 	}
 }
 
+func TestCLIDeleteAndRestore(t *testing.T) {
+	const secret = "test-secret"
+	var deleted bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+secret {
+			t.Errorf("Authorization = %q", got)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var input struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			t.Errorf("decode input: %v", err)
+		}
+		if input.ID != "test-task" {
+			t.Errorf("id = %q", input.ID)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/tools/delete_task":
+			deleted = true
+			_, _ = io.WriteString(w, `{"data":{"id":"test-task","version":2,"deleted_at":"2026-07-24T12:00:00Z"}}`)
+		case "/api/tools/restore_task":
+			deleted = false
+			_, _ = io.WriteString(w, `{"data":{"id":"test-task","version":3}}`)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("TASKS_API_URL", server.URL)
+	t.Setenv("TASKS_SECRET", secret)
+	t.Setenv("TASKS_DATABASE_URL", "")
+
+	var output bytes.Buffer
+	var errors bytes.Buffer
+	if code := run([]string{"delete", "test-task"}, strings.NewReader(""), &output, &errors); code != 0 {
+		t.Fatalf("delete exit = %d; stderr: %s", code, errors.String())
+	}
+	if got := output.String(); got != "deleted test-task\n" {
+		t.Fatalf("delete output = %q", got)
+	}
+	if !deleted {
+		t.Fatal("delete command did not call delete_task")
+	}
+
+	output.Reset()
+	errors.Reset()
+	if code := run([]string{"restore", "test-task"}, strings.NewReader(""), &output, &errors); code != 0 {
+		t.Fatalf("restore exit = %d; stderr: %s", code, errors.String())
+	}
+	if got := output.String(); got != "restored test-task\n" {
+		t.Fatalf("restore output = %q", got)
+	}
+	if deleted {
+		t.Fatal("restore command did not call restore_task")
+	}
+
+	output.Reset()
+	errors.Reset()
+	if code := run([]string{"delete"}, strings.NewReader(""), &output, &errors); code != 2 {
+		t.Fatalf("delete without an ID exit = %d, want 2", code)
+	}
+	if !strings.Contains(errors.String(), "Usage: tasks delete <task-id>") {
+		t.Fatalf("stderr = %q", errors.String())
+	}
+}
+
 func TestCLIHasNoListCommand(t *testing.T) {
 	// "list" is rejected as an unknown command before any database connection.
 	var output bytes.Buffer

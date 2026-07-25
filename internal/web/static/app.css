@@ -132,6 +132,12 @@ button.quiet, button.ghost {
 }
 button.quiet:hover, button.ghost:hover { background: var(--surface); }
 button.small { padding: .35rem .7rem; font-size: .78rem; }
+button.danger {
+  color: var(--danger);
+  background: transparent;
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+}
+button.danger:hover { color: var(--surface); background: var(--danger); border-color: var(--danger); }
 
 /* ---------------------------------------------------------------- header - */
 
@@ -228,6 +234,9 @@ kbd {
   font-family: var(--mono);
   font-size: .72rem;
 }
+.board-deleted { margin: 0 0 .1rem; font-size: .78rem; }
+.board-deleted a { color: var(--ink-faint); }
+.board-deleted a:hover { color: var(--ink); }
 .board-filter { margin-bottom: .1rem; }
 .board-filter input {
   width: min(15rem, 40vw);
@@ -798,6 +807,49 @@ figcaption {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Deleting is reversible, so its control sits quietly below the task rather
+   than competing with the workflow buttons above it. */
+.detail-delete {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem .8rem;
+  align-items: center;
+  margin-top: 1.4rem;
+  padding-top: .9rem;
+  border-top: 1px solid var(--rule);
+}
+.detail-delete span { color: var(--ink-faint); font-size: .76rem; }
+
+/* --------------------------------------------------------- deleted tasks - */
+
+.deleted-page main { max-width: 52rem; }
+.deleted-list { display: grid; gap: .6rem; padding: 0; margin: 0; list-style: none; }
+.deleted-item {
+  display: flex;
+  gap: 1.2rem;
+  align-items: start;
+  justify-content: space-between;
+  padding: .9rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+}
+.deleted-summary { min-width: 0; }
+.deleted-title { margin: 0; font-family: var(--display); font-size: 1.02rem; line-height: 1.3; }
+.deleted-item .card-excerpt { margin: .3rem 0 0; }
+.deleted-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .55rem;
+  align-items: center;
+  margin: .5rem 0 0;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: .66rem;
+}
+.deleted-item form { margin: 0; }
 
 .attachment-panel { margin-top: 1.4rem; padding-top: .9rem; border-top: 1px solid var(--rule); }
 .attachment-panel summary {

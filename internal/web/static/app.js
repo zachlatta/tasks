@@ -177,6 +177,54 @@
     }
   }
 
+  /* ------------------------------------------------- delete and restore - */
+
+  async function requestTaskAction(id, action, fallbackError) {
+    const response = await fetch(`/tasks/${encodeURIComponent(id)}/${action}`, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ csrf }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || fallbackError);
+    return payload;
+  }
+
+  // Deleting is reversible, so the card leaves the board with an undo attached
+  // rather than a confirmation in front of it.
+  async function deleteTask(id) {
+    try {
+      const result = await requestTaskAction(id, 'delete', 'Could not delete that task.');
+      const card = findCard(id);
+      if (card) card.remove();
+      closeDrawer();
+      refresh();
+      toast(result.message, { action: { label: 'Undo', run: () => undoDelete(id) } });
+    } catch (error) {
+      toast(error.message, { tone: 'error' });
+    }
+  }
+
+  async function undoDelete(id) {
+    try {
+      const result = await requestTaskAction(id, 'restore', 'Could not restore that task.');
+      const list = listFor(result.status);
+      const holder = document.createElement('div');
+      holder.innerHTML = (result.card || '').trim();
+      const fresh = holder.firstElementChild;
+      if (list && fresh) {
+        insertCard(list, fresh, cardsIn(list)[result.index] || null);
+        fresh.classList.add('settled');
+      }
+      refresh();
+    } catch (error) {
+      toast(error.message, { tone: 'error' });
+    }
+  }
+
   async function undoMove(id, place) {
     const card = findCard(id);
     if (!card) return;
@@ -407,6 +455,12 @@
         } catch (error) {
           toast(error.message, { tone: 'error' });
         }
+        return;
+      }
+
+      if (form.classList.contains('detail-delete')) {
+        event.preventDefault();
+        deleteTask(id);
         return;
       }
 

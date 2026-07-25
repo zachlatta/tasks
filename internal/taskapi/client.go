@@ -81,6 +81,14 @@ func (c *Client) CompleteTask(ctx context.Context, input CompleteTaskInput) (tas
 	return call[task.Task](ctx, c, CompleteTaskTool, input)
 }
 
+func (c *Client) DeleteTask(ctx context.Context, input DeleteTaskInput) (task.Task, error) {
+	return call[task.Task](ctx, c, DeleteTaskTool, input)
+}
+
+func (c *Client) RestoreTask(ctx context.Context, input RestoreTaskInput) (task.Task, error) {
+	return call[task.Task](ctx, c, RestoreTaskTool, input)
+}
+
 func call[Output, Input any](ctx context.Context, client *Client, name string, input Input) (Output, error) {
 	var zero Output
 	body, err := json.Marshal(input)

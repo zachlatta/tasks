@@ -16,6 +16,8 @@ type SQLQueryInput = taskapi.SQLQueryInput
 type SQLQueryOutput = taskapi.SQLQueryOutput
 type CreateTaskInput = taskapi.CreateTaskInput
 type CompleteTaskInput = taskapi.CompleteTaskInput
+type DeleteTaskInput = taskapi.DeleteTaskInput
+type RestoreTaskInput = taskapi.RestoreTaskInput
 type UpdateTaskInput = taskapi.UpdateTaskInput
 type EditTaskTextInput = taskapi.EditTaskTextInput
 
@@ -80,6 +82,28 @@ func NewWithTools(tools *taskapi.Tools, version string) *mcp.Server {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input CompleteTaskInput) (*mcp.CallToolResult, task.Task, error) {
 		completed, err := tools.CompleteTask(mutationContext(ctx), input)
 		return nil, completed, err
+	})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:  taskapi.DeleteTaskTool,
+		Title: "Delete a task",
+		Description: "Soft-deletes a task: it leaves the board and every read, while its row and complete revision history stay in the database. " +
+			"restore_task brings it back with its status, order, text, dependencies, and files intact. " +
+			"A task other live tasks still depend on cannot be deleted; delete or re-point those first. " +
+			"Deleted tasks are absent from task_overview; find them with SELECT id, title, deleted_at FROM tasks WHERE deleted_at IS NOT NULL.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPointer(true), IdempotentHint: true, OpenWorldHint: &closedWorld},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input DeleteTaskInput) (*mcp.CallToolResult, task.Task, error) {
+		deleted, err := tools.DeleteTask(mutationContext(ctx), input)
+		return nil, deleted, err
+	})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:  taskapi.RestoreTaskTool,
+		Title: "Restore a deleted task",
+		Description: "Returns a soft-deleted task to the board unchanged. " +
+			"A task whose own dependencies are still deleted cannot be restored until they are.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPointer(false), IdempotentHint: true, OpenWorldHint: &closedWorld},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input RestoreTaskInput) (*mcp.CallToolResult, task.Task, error) {
+		restored, err := tools.RestoreTask(mutationContext(ctx), input)
+		return nil, restored, err
 	})
 	return server
 }

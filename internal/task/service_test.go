@@ -475,6 +475,192 @@ func TestEditRequiresARequestedChangeAndSkipsNoOpWrites(t *testing.T) {
 	}
 }
 
+func TestDeleteHidesTaskAndRestoreBringsItBack(t *testing.T) {
+	t.Parallel()
+
+	service, repo := boardService(t, "keeper", "gone")
+	seed(t, service, "Keeper", "Gone")
+	// Newest first, so the todo column reads gone, keeper.
+	if _, err := service.Move(context.Background(), "gone", StatusInProgress, 0); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	before, err := service.Get(context.Background(), "gone")
+	if err != nil {
+		t.Fatalf("Get before delete: %v", err)
+	}
+
+	deleted, err := service.Delete(context.Background(), "gone")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if deleted.DeletedAt == nil {
+		t.Fatalf("deleted task = %#v, want a deletion timestamp", deleted)
+	}
+	if deleted.Version != before.Version+1 {
+		t.Fatalf("deleted version = %d, want %d", deleted.Version, before.Version+1)
+	}
+	if _, err := service.Get(context.Background(), "gone"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get after delete error = %v, want ErrNotFound", err)
+	}
+	if got, want := columnIDs(t, service, StatusInProgress), []string{}; !slices.Equal(got, want) {
+		t.Fatalf("in-progress column after delete = %v, want %v", got, want)
+	}
+	// Soft delete keeps the row, so the history and the task itself survive.
+	stored, err := repo.Get(context.Background(), "gone")
+	if err != nil {
+		t.Fatalf("stored task after delete: %v", err)
+	}
+	if stored.Title != "Gone" || stored.Status != StatusInProgress {
+		t.Fatalf("stored task = %#v, want the task preserved", stored)
+	}
+
+	restored, err := service.Restore(context.Background(), "gone")
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if restored.DeletedAt != nil {
+		t.Fatalf("restored task = %#v, want no deletion timestamp", restored)
+	}
+	if restored.Status != before.Status || restored.Position != before.Position {
+		t.Fatalf("restored place = %q/%v, want %q/%v", restored.Status, restored.Position, before.Status, before.Position)
+	}
+	if restored.Version != deleted.Version+1 {
+		t.Fatalf("restored version = %d, want %d", restored.Version, deleted.Version+1)
+	}
+	if got, want := columnIDs(t, service, StatusInProgress), []string{"gone"}; !slices.Equal(got, want) {
+		t.Fatalf("in-progress column after restore = %v, want %v", got, want)
+	}
+}
+
+func TestDeleteAndRestoreAreIdempotent(t *testing.T) {
+	t.Parallel()
+
+	service, _ := boardService(t, "only")
+	seed(t, service, "Only task")
+
+	deleted, err := service.Delete(context.Background(), "only")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	again, err := service.Delete(context.Background(), "only")
+	if err != nil {
+		t.Fatalf("Delete already deleted: %v", err)
+	}
+	if again.Version != deleted.Version {
+		t.Fatalf("repeated Delete version = %d, want unchanged %d", again.Version, deleted.Version)
+	}
+	restored, err := service.Restore(context.Background(), "only")
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	stillThere, err := service.Restore(context.Background(), "only")
+	if err != nil {
+		t.Fatalf("Restore a live task: %v", err)
+	}
+	if stillThere.Version != restored.Version {
+		t.Fatalf("repeated Restore version = %d, want unchanged %d", stillThere.Version, restored.Version)
+	}
+	if _, err := service.Delete(context.Background(), "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Delete missing task error = %v, want ErrNotFound", err)
+	}
+	if _, err := service.Restore(context.Background(), "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Restore missing task error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeleteRejectsTaskLiveTasksDependOn(t *testing.T) {
+	t.Parallel()
+
+	service, _ := boardService(t, "prerequisite", "dependent")
+	if _, err := service.Create(context.Background(), CreateInput{Title: "Prerequisite"}); err != nil {
+		t.Fatalf("Create prerequisite: %v", err)
+	}
+	if _, err := service.Create(context.Background(), CreateInput{Title: "Dependent", Dependencies: []string{"prerequisite"}}); err != nil {
+		t.Fatalf("Create dependent: %v", err)
+	}
+
+	if _, err := service.Delete(context.Background(), "prerequisite"); !errors.Is(err, ErrHasDependents) {
+		t.Fatalf("Delete error = %v, want ErrHasDependents", err)
+	}
+	untouched, err := service.Get(context.Background(), "prerequisite")
+	if err != nil || untouched.Version != 1 {
+		t.Fatalf("prerequisite after rejected delete = %#v, %v", untouched, err)
+	}
+	// Deleting the dependent first frees the prerequisite.
+	if _, err := service.Delete(context.Background(), "dependent"); err != nil {
+		t.Fatalf("Delete dependent: %v", err)
+	}
+	if _, err := service.Delete(context.Background(), "prerequisite"); err != nil {
+		t.Fatalf("Delete freed prerequisite: %v", err)
+	}
+}
+
+func TestRestoreRequiresLiveDependencies(t *testing.T) {
+	t.Parallel()
+
+	service, _ := boardService(t, "prerequisite", "dependent")
+	if _, err := service.Create(context.Background(), CreateInput{Title: "Prerequisite"}); err != nil {
+		t.Fatalf("Create prerequisite: %v", err)
+	}
+	if _, err := service.Create(context.Background(), CreateInput{Title: "Dependent", Dependencies: []string{"prerequisite"}}); err != nil {
+		t.Fatalf("Create dependent: %v", err)
+	}
+	for _, id := range []string{"dependent", "prerequisite"} {
+		if _, err := service.Delete(context.Background(), id); err != nil {
+			t.Fatalf("Delete %q: %v", id, err)
+		}
+	}
+
+	if _, err := service.Restore(context.Background(), "dependent"); !errors.Is(err, ErrDependencyNotFound) {
+		t.Fatalf("Restore error = %v, want ErrDependencyNotFound", err)
+	}
+	if _, err := service.Restore(context.Background(), "prerequisite"); err != nil {
+		t.Fatalf("Restore prerequisite: %v", err)
+	}
+	if _, err := service.Restore(context.Background(), "dependent"); err != nil {
+		t.Fatalf("Restore dependent after its dependency: %v", err)
+	}
+}
+
+func TestDeletedTasksAreInvisibleToEveryOtherOperation(t *testing.T) {
+	t.Parallel()
+
+	service, _ := boardService(t, "gone", "live")
+	seed(t, service, "Gone", "Live")
+	if _, err := service.Delete(context.Background(), "gone"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	title := "Renamed"
+	for name, operation := range map[string]func() error{
+		"get":      func() error { _, err := service.Get(context.Background(), "gone"); return err },
+		"start":    func() error { _, err := service.Start(context.Background(), "gone"); return err },
+		"complete": func() error { _, err := service.Complete(context.Background(), "gone"); return err },
+		"move":     func() error { _, err := service.Move(context.Background(), "gone", StatusDone, 0); return err },
+		"edit": func() error {
+			_, err := service.Edit(context.Background(), "gone", EditInput{Title: &title})
+			return err
+		},
+		"add attachment": func() error {
+			_, err := service.AddAttachment(context.Background(), "gone", Attachment{Key: "k", Name: "n"})
+			return err
+		},
+	} {
+		if err := operation(); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%s on a deleted task error = %v, want ErrNotFound", name, err)
+		}
+	}
+
+	// A deleted task can no longer be named as a dependency.
+	if _, err := service.Create(context.Background(), CreateInput{Title: "New", Dependencies: []string{"gone"}}); !errors.Is(err, ErrDependencyNotFound) {
+		t.Fatalf("Create depending on a deleted task error = %v, want ErrDependencyNotFound", err)
+	}
+	dependencies := []string{"gone"}
+	if _, err := service.Edit(context.Background(), "live", EditInput{Dependencies: &dependencies}); !errors.Is(err, ErrDependencyNotFound) {
+		t.Fatalf("Edit depending on a deleted task error = %v, want ErrDependencyNotFound", err)
+	}
+}
+
 // boardService returns a service whose clock advances a minute per call and
 // whose IDs come from ids in order, so board ordering assertions stay readable.
 func boardService(t *testing.T, ids ...string) (*Service, *memoryRepository) {

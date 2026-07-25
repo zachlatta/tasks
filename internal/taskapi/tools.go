@@ -15,6 +15,8 @@ const (
 	EditTaskTextTool  = "edit_task_text"
 	UpdateTaskTool    = "update_task"
 	CompleteTaskTool  = "complete_task"
+	DeleteTaskTool    = "delete_task"
+	RestoreTaskTool   = "restore_task"
 )
 
 // Reader runs trusted, read-only SQL against the task tables.
@@ -40,6 +42,14 @@ type CreateTaskInput struct {
 
 type CompleteTaskInput struct {
 	ID string `json:"id" jsonschema:"ID of the task to complete."`
+}
+
+type DeleteTaskInput struct {
+	ID string `json:"id" jsonschema:"ID of the task to delete. The deletion is soft: the row and its history stay and restore_task brings the task back."`
+}
+
+type RestoreTaskInput struct {
+	ID string `json:"id" jsonschema:"ID of the deleted task to restore to the board."`
 }
 
 type UpdateTaskInput struct {
@@ -98,4 +108,12 @@ func (t *Tools) UpdateTask(ctx context.Context, input UpdateTaskInput) (task.Tas
 
 func (t *Tools) CompleteTask(ctx context.Context, input CompleteTaskInput) (task.Task, error) {
 	return t.tasks.Complete(ctx, input.ID)
+}
+
+func (t *Tools) DeleteTask(ctx context.Context, input DeleteTaskInput) (task.Task, error) {
+	return t.tasks.Delete(ctx, input.ID)
+}
+
+func (t *Tools) RestoreTask(ctx context.Context, input RestoreTaskInput) (task.Task, error) {
+	return t.tasks.Restore(ctx, input.ID)
 }

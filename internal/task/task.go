@@ -23,6 +23,7 @@ var (
 	ErrBlocked            = errors.New("task is blocked by incomplete dependencies")
 	ErrDependencyNotFound = errors.New("task dependency not found")
 	ErrConflict           = errors.New("task was changed by another writer")
+	ErrHasDependents      = errors.New("other tasks depend on this task")
 	ErrInvalid            = errors.New("invalid task")
 	ErrNotFound           = errors.New("task not found")
 )
@@ -44,6 +45,15 @@ type Task struct {
 	CreatedAt    time.Time    `json:"created_at" yaml:"created_at"`
 	UpdatedAt    time.Time    `json:"updated_at" yaml:"updated_at"`
 	Version      int64        `json:"version" yaml:"version"`
+	// DeletedAt marks a soft-deleted task. The row and its whole revision
+	// history stay; the task simply leaves the board and every read until it is
+	// restored. Nil means the task is live.
+	DeletedAt *time.Time `json:"deleted_at,omitempty" yaml:"deleted_at,omitempty"`
+}
+
+// Deleted reports whether the task has been soft-deleted.
+func (t Task) Deleted() bool {
+	return t.DeletedAt != nil
 }
 
 // positionGap is the spacing a task claims when it lands at the top or bottom
@@ -133,7 +143,7 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Task, error) {
 	}
 	dependencies := uniqueNonEmpty(input.Dependencies)
 	for _, dependency := range dependencies {
-		if _, err := s.repository.Get(ctx, dependency); err != nil {
+		if _, err := s.live(ctx, dependency); err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return Task{}, fmt.Errorf("%w: %s", ErrDependencyNotFound, dependency)
 			}
@@ -167,7 +177,7 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Task, error) {
 }
 
 func (s *Service) Complete(ctx context.Context, id string) (Task, error) {
-	current, err := s.repository.Get(ctx, id)
+	current, err := s.live(ctx, id)
 	if err != nil {
 		return Task{}, err
 	}
@@ -178,7 +188,7 @@ func (s *Service) Complete(ctx context.Context, id string) (Task, error) {
 }
 
 func (s *Service) Start(ctx context.Context, id string) (Task, error) {
-	current, err := s.repository.Get(ctx, id)
+	current, err := s.live(ctx, id)
 	if err != nil {
 		return Task{}, err
 	}
@@ -201,13 +211,13 @@ func (s *Service) Move(ctx context.Context, id string, status Status, index int)
 	default:
 		return Task{}, fmt.Errorf("%w: unknown status %q", ErrInvalid, status)
 	}
-	current, err := s.repository.Get(ctx, id)
+	current, err := s.live(ctx, id)
 	if err != nil {
 		return Task{}, err
 	}
 	if status == StatusDone {
 		for _, dependency := range current.Dependencies {
-			required, err := s.repository.Get(ctx, dependency)
+			required, err := s.live(ctx, dependency)
 			if err != nil {
 				return Task{}, err
 			}
@@ -267,7 +277,7 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 		return Task{}, fmt.Errorf("%w: expected version must be positive", ErrInvalid)
 	}
 
-	current, err := s.repository.Get(ctx, id)
+	current, err := s.live(ctx, id)
 	if err != nil {
 		return Task{}, err
 	}
@@ -317,6 +327,83 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 	return clone(edited), nil
 }
 
+// Delete soft-deletes a task. The stored row and its whole revision history
+// stay behind; the task leaves the board and every other read until Restore
+// brings it back exactly where it was. Deleting a task that live tasks still
+// depend on is refused, which keeps every live dependency resolvable. Deleting
+// an already-deleted task changes nothing.
+func (s *Service) Delete(ctx context.Context, id string) (Task, error) {
+	current, err := s.repository.Get(ctx, id)
+	if err != nil {
+		return Task{}, err
+	}
+	if current.Deleted() {
+		return clone(current), nil
+	}
+	items, err := s.repository.List(ctx)
+	if err != nil {
+		return Task{}, err
+	}
+	for _, item := range items {
+		if item.ID == id || item.Deleted() {
+			continue
+		}
+		if slices.Contains(item.Dependencies, id) {
+			return Task{}, fmt.Errorf("%w: %s depends on it", ErrHasDependents, item.ID)
+		}
+	}
+	deletedAt := s.now().UTC()
+	current.DeletedAt = &deletedAt
+	current.UpdatedAt = deletedAt
+	current.Version++
+	if err := s.repository.Update(withAuditAction(ctx, "delete"), current); err != nil {
+		return Task{}, err
+	}
+	return clone(current), nil
+}
+
+// Restore returns a soft-deleted task to the board with its status, board
+// position, text, dependencies, and attachments intact. A task whose own
+// dependencies are still deleted cannot be restored, so its prerequisites come
+// back first. Restoring a live task changes nothing.
+func (s *Service) Restore(ctx context.Context, id string) (Task, error) {
+	current, err := s.repository.Get(ctx, id)
+	if err != nil {
+		return Task{}, err
+	}
+	if !current.Deleted() {
+		return clone(current), nil
+	}
+	for _, dependency := range current.Dependencies {
+		if _, err := s.live(ctx, dependency); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return Task{}, fmt.Errorf("%w: %s; restore it first", ErrDependencyNotFound, dependency)
+			}
+			return Task{}, err
+		}
+	}
+	current.DeletedAt = nil
+	current.UpdatedAt = s.now().UTC()
+	current.Version++
+	if err := s.repository.Update(withAuditAction(ctx, "restore"), current); err != nil {
+		return Task{}, err
+	}
+	return clone(current), nil
+}
+
+// live loads a task that is still on the board. A soft-deleted task reads as
+// missing to every operation except Delete and Restore.
+func (s *Service) live(ctx context.Context, id string) (Task, error) {
+	item, err := s.repository.Get(ctx, id)
+	if err != nil {
+		return Task{}, err
+	}
+	if item.Deleted() {
+		return Task{}, ErrNotFound
+	}
+	return item, nil
+}
+
 // column returns the tasks in one board column, top first.
 func (s *Service) column(ctx context.Context, status Status) ([]Task, error) {
 	items, err := s.repository.List(ctx)
@@ -325,7 +412,7 @@ func (s *Service) column(ctx context.Context, status Status) ([]Task, error) {
 	}
 	column := make([]Task, 0, len(items))
 	for _, item := range items {
-		if item.Status == status {
+		if item.Status == status && !item.Deleted() {
 			column = append(column, clone(item))
 		}
 	}
@@ -392,14 +479,22 @@ func beforeInColumn(first, second Task) bool {
 }
 
 func (s *Service) Get(ctx context.Context, id string) (Task, error) {
-	item, err := s.repository.Get(ctx, id)
+	item, err := s.live(ctx, id)
 	return clone(item), err
 }
 
+// List returns every live task. Soft-deleted tasks are left out; they are read
+// back through the store's own deleted-task projection.
 func (s *Service) List(ctx context.Context) ([]Task, error) {
-	items, err := s.repository.List(ctx)
+	stored, err := s.repository.List(ctx)
 	if err != nil {
 		return nil, err
+	}
+	items := make([]Task, 0, len(stored))
+	for _, item := range stored {
+		if !item.Deleted() {
+			items = append(items, item)
+		}
 	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].Status != items[j].Status {
@@ -430,7 +525,7 @@ func (s *Service) AddAttachment(ctx context.Context, id string, attachment Attac
 	if strings.TrimSpace(attachment.Key) == "" || strings.TrimSpace(attachment.Name) == "" {
 		return Task{}, fmt.Errorf("%w: attachment key and name are required", ErrInvalid)
 	}
-	current, err := s.repository.Get(ctx, id)
+	current, err := s.live(ctx, id)
 	if err != nil {
 		return Task{}, err
 	}
@@ -496,7 +591,9 @@ func (s *Service) validateEditedDependencies(ctx context.Context, taskID string,
 	}
 	byID := make(map[string]Task, len(items))
 	for _, item := range items {
-		byID[item.ID] = item
+		if !item.Deleted() {
+			byID[item.ID] = item
+		}
 	}
 	for _, dependency := range dependencies {
 		if _, ok := byID[dependency]; !ok {
@@ -535,5 +632,9 @@ func withAuditAction(ctx context.Context, action string) context.Context {
 func clone(item Task) Task {
 	item.Dependencies = slices.Clone(item.Dependencies)
 	item.Attachments = slices.Clone(item.Attachments)
+	if item.DeletedAt != nil {
+		deletedAt := *item.DeletedAt
+		item.DeletedAt = &deletedAt
+	}
 	return item
 }

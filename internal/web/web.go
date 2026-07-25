@@ -33,10 +33,12 @@ import (
 	"github.com/zachlatta/tasks/internal/task"
 )
 
-// Reader provides the fixed task projection the index page renders. In
-// production it is the PostgreSQL store; tests use an in-memory implementation.
+// Reader provides the fixed task projections the pages render: the live board
+// and the list of soft-deleted tasks. In production it is the PostgreSQL store;
+// tests use an in-memory implementation.
 type Reader interface {
 	Tasks(ctx context.Context) ([]task.Task, error)
+	DeletedTasks(ctx context.Context) ([]task.Task, error)
 }
 
 // SessionStore persists browser sessions keyed by a hash of the session cookie
@@ -116,12 +118,14 @@ type session struct {
 type sessionContextKey struct{}
 
 type pageData struct {
-	Error      string
-	CSRF       string
-	Columns    []boardColumn
-	DetailTask taskCard
-	TaskCount  int
-	Message    string
+	Error        string
+	CSRF         string
+	Columns      []boardColumn
+	DetailTask   taskCard
+	TaskCount    int
+	Deleted      []taskCard
+	DeletedCount int
+	Message      string
 }
 
 // boardColumn is one kanban column: a workflow state plus the cards currently
@@ -150,6 +154,10 @@ type taskCard struct {
 	DependsOn   []dependencyView
 	Cover       *task.Attachment
 	Moves       []moveOption
+	// DeletedRelative and DeletedTimestamp describe when a soft-deleted task
+	// left the board, for the list of deleted tasks.
+	DeletedRelative  string
+	DeletedTimestamp string
 }
 
 // dependencyView names a prerequisite so a card can show what is holding it up
@@ -176,6 +184,24 @@ type moveResult struct {
 	Status      Status `json:"status"`
 	StatusLabel string `json:"status_label"`
 	Card        string `json:"card"`
+	Message     string `json:"message"`
+}
+
+// deleteResult tells the board which card to take away, and carries the message
+// whose undo restores it.
+type deleteResult struct {
+	ID      string `json:"id"`
+	Message string `json:"message"`
+}
+
+// restoreResult carries a restored task's card back to the board along with the
+// place in its column it belongs, so an undo puts the card exactly where it was.
+type restoreResult struct {
+	ID          string `json:"id"`
+	Status      Status `json:"status"`
+	StatusLabel string `json:"status_label"`
+	Card        string `json:"card"`
+	Index       int    `json:"index"`
 	Message     string `json:"message"`
 }
 
@@ -222,6 +248,9 @@ func New(config Config) http.Handler {
 	h.mux.Handle("POST /tasks", h.requireSession(http.HandlerFunc(h.createTask)))
 	h.mux.Handle("POST /tasks/{id}/edit", h.requireSession(http.HandlerFunc(h.editTask)))
 	h.mux.Handle("POST /tasks/{id}/move", h.requireSession(http.HandlerFunc(h.moveTask)))
+	h.mux.Handle("POST /tasks/{id}/delete", h.requireSession(http.HandlerFunc(h.deleteTask)))
+	h.mux.Handle("POST /tasks/{id}/restore", h.requireSession(http.HandlerFunc(h.restoreTask)))
+	h.mux.Handle("GET /deleted", h.requireSession(http.HandlerFunc(h.deletedTasks)))
 	h.mux.Handle("POST /tasks/{id}/attachments", h.requireSession(http.HandlerFunc(h.uploadAttachment)))
 	h.mux.Handle("GET /attachments/{key...}", h.requireSession(http.HandlerFunc(h.attachment)))
 	// Keep the image routes working for pages loaded before attachments were
@@ -307,6 +336,11 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "query tasks", http.StatusInternalServerError)
 		return
 	}
+	deleted, err := h.reader.DeletedTasks(r.Context())
+	if err != nil {
+		http.Error(w, "query deleted tasks", http.StatusInternalServerError)
+		return
+	}
 	current := r.Context().Value(sessionContextKey{}).(session)
 	byID := make(map[string]task.Task, len(items))
 	for _, item := range items {
@@ -330,10 +364,36 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		columns[index].Tasks = append(columns[index].Tasks, h.newTaskCard(item, current.CSRF, lookup))
 	}
 	h.render(w, http.StatusOK, "index.html", pageData{
-		CSRF:      current.CSRF,
-		Columns:   columns,
-		TaskCount: len(items),
-		Message:   r.URL.Query().Get("message"),
+		CSRF:         current.CSRF,
+		Columns:      columns,
+		TaskCount:    len(items),
+		DeletedCount: len(deleted),
+		Message:      r.URL.Query().Get("message"),
+	})
+}
+
+// deletedTasks lists the soft-deleted tasks so they can be read and restored.
+// It is the only page that shows a task that has left the board.
+func (h *handler) deletedTasks(w http.ResponseWriter, r *http.Request) {
+	items, err := h.reader.DeletedTasks(r.Context())
+	if err != nil {
+		http.Error(w, "query deleted tasks", http.StatusInternalServerError)
+		return
+	}
+	current := r.Context().Value(sessionContextKey{}).(session)
+	cards := make([]taskCard, 0, len(items))
+	for _, item := range items {
+		// The list summarizes deleted tasks; it does not render dependency
+		// detail, so nothing needs resolving.
+		cards = append(cards, h.newTaskCard(item, current.CSRF, func(string) (task.Task, bool) {
+			return task.Task{}, false
+		}))
+	}
+	h.render(w, http.StatusOK, "deleted.html", pageData{
+		CSRF:         current.CSRF,
+		Deleted:      cards,
+		DeletedCount: len(cards),
+		Message:      r.URL.Query().Get("message"),
 	})
 }
 
@@ -383,12 +443,12 @@ func (h *handler) createTask(w http.ResponseWriter, r *http.Request) {
 // a newer edit.
 func (h *handler) editTask(w http.ResponseWriter, r *http.Request) {
 	if !h.validCSRF(r) {
-		h.editFailed(w, r, http.StatusForbidden, "invalid CSRF token")
+		h.mutationFailed(w, r, http.StatusForbidden, "invalid CSRF token")
 		return
 	}
 	version, err := strconv.ParseInt(strings.TrimSpace(r.PostForm.Get("expected_version")), 10, 64)
 	if err != nil || version < 1 {
-		h.editFailed(w, r, http.StatusBadRequest, "expected version must be a positive whole number")
+		h.mutationFailed(w, r, http.StatusBadRequest, "expected version must be a positive whole number")
 		return
 	}
 
@@ -403,7 +463,7 @@ func (h *handler) editTask(w http.ResponseWriter, r *http.Request) {
 		input.Description = &value
 		message = "Updated description"
 	default:
-		h.editFailed(w, r, http.StatusBadRequest, "field must be title or description")
+		h.mutationFailed(w, r, http.StatusBadRequest, "field must be title or description")
 		return
 	}
 
@@ -416,7 +476,7 @@ func (h *handler) editTask(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, task.ErrNotFound):
 			code = http.StatusNotFound
 		}
-		h.editFailed(w, r, code, err.Error())
+		h.mutationFailed(w, r, code, err.Error())
 		return
 	}
 	if !wantsJSON(r) {
@@ -448,27 +508,19 @@ func (h *handler) writeEdit(w http.ResponseWriter, r *http.Request, item task.Ta
 	})
 }
 
-func (h *handler) editFailed(w http.ResponseWriter, r *http.Request, code int, message string) {
-	if wantsJSON(r) {
-		writeJSON(w, code, map[string]string{"error": message})
-		return
-	}
-	http.Error(w, message, code)
-}
-
 // moveTask drops a task into a column at a position. Drag and drop calls it
 // with an explicit index and reads the refreshed card back as JSON; the move
 // buttons on each card post the same form and follow a redirect.
 func (h *handler) moveTask(w http.ResponseWriter, r *http.Request) {
 	if !h.validCSRF(r) {
-		h.moveFailed(w, r, http.StatusForbidden, "invalid CSRF token")
+		h.mutationFailed(w, r, http.StatusForbidden, "invalid CSRF token")
 		return
 	}
 	index := 0
 	if raw := strings.TrimSpace(r.PostForm.Get("index")); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err != nil {
-			h.moveFailed(w, r, http.StatusBadRequest, "index must be a whole number")
+			h.mutationFailed(w, r, http.StatusBadRequest, "index must be a whole number")
 			return
 		}
 		index = parsed
@@ -483,7 +535,7 @@ func (h *handler) moveTask(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, task.ErrNotFound):
 			code = http.StatusNotFound
 		}
-		h.moveFailed(w, r, code, err.Error())
+		h.mutationFailed(w, r, code, err.Error())
 		return
 	}
 	message := "Moved to " + statusLabel(moved.Status)
@@ -492,6 +544,94 @@ func (h *handler) moveTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.writeCard(w, r, moved, message)
+}
+
+// deleteTask soft-deletes a task. The board drops the card and offers an undo
+// that restores it; a posted form redirects back to the board instead.
+func (h *handler) deleteTask(w http.ResponseWriter, r *http.Request) {
+	if !h.validCSRF(r) {
+		h.mutationFailed(w, r, http.StatusForbidden, "invalid CSRF token")
+		return
+	}
+	deleted, err := h.tasks.Delete(webMutationContext(r.Context()), r.PathValue("id"))
+	if err != nil {
+		h.mutationFailed(w, r, statusForTaskError(err), err.Error())
+		return
+	}
+	message := "Deleted " + deleted.ID
+	if !wantsJSON(r) {
+		redirectWithMessage(w, r, message)
+		return
+	}
+	writeJSON(w, http.StatusOK, deleteResult{ID: deleted.ID, Message: message})
+}
+
+// restoreTask puts a soft-deleted task back on the board, either as the board's
+// undo or from the list of deleted tasks.
+func (h *handler) restoreTask(w http.ResponseWriter, r *http.Request) {
+	if !h.validCSRF(r) {
+		h.mutationFailed(w, r, http.StatusForbidden, "invalid CSRF token")
+		return
+	}
+	restored, err := h.tasks.Restore(webMutationContext(r.Context()), r.PathValue("id"))
+	if err != nil {
+		h.mutationFailed(w, r, statusForTaskError(err), err.Error())
+		return
+	}
+	message := "Restored " + restored.ID
+	if !wantsJSON(r) {
+		http.Redirect(w, r, "/deleted?message="+url.QueryEscape(message), http.StatusSeeOther)
+		return
+	}
+	current := r.Context().Value(sessionContextKey{}).(session)
+	card := h.newTaskCard(restored, current.CSRF, h.storedTask(r.Context()))
+	var rendered bytes.Buffer
+	if err := h.templates.ExecuteTemplate(&rendered, "task-card", card); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "render card"})
+		return
+	}
+	writeJSON(w, http.StatusOK, restoreResult{
+		ID:          restored.ID,
+		Status:      restored.Status,
+		StatusLabel: statusLabel(restored.Status),
+		Card:        rendered.String(),
+		Index:       h.columnIndex(r.Context(), restored),
+		Message:     message,
+	})
+}
+
+// columnIndex reports where a task sits in its own column, top card first, so
+// the board can reinsert a restored card exactly where it belongs.
+func (h *handler) columnIndex(ctx context.Context, item task.Task) int {
+	items, err := h.reader.Tasks(ctx)
+	if err != nil {
+		return 0
+	}
+	index := 0
+	for _, other := range items {
+		if other.Status != item.Status {
+			continue
+		}
+		if other.ID == item.ID {
+			return index
+		}
+		index++
+	}
+	return 0
+}
+
+// statusForTaskError maps a refused delete or restore onto the closest HTTP
+// status, so both the board and a posted form report the real reason.
+func statusForTaskError(err error) int {
+	switch {
+	case errors.Is(err, task.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, task.ErrHasDependents),
+		errors.Is(err, task.ErrDependencyNotFound),
+		errors.Is(err, task.ErrConflict):
+		return http.StatusConflict
+	}
+	return http.StatusBadRequest
 }
 
 // writeCard answers a mutation with the task's freshly rendered board card, so
@@ -513,9 +653,9 @@ func (h *handler) writeCard(w http.ResponseWriter, r *http.Request, item task.Ta
 	})
 }
 
-// moveFailed reports a rejected move to whichever client asked for it: JSON for
-// drag and drop, plain text for a posted form.
-func (h *handler) moveFailed(w http.ResponseWriter, r *http.Request, code int, message string) {
+// mutationFailed reports a rejected task change to whichever client asked for
+// it: JSON for the board's own requests, plain text for a posted form.
+func (h *handler) mutationFailed(w http.ResponseWriter, r *http.Request, code int, message string) {
 	if wantsJSON(r) {
 		writeJSON(w, code, map[string]string{"error": message})
 		return
@@ -531,6 +671,10 @@ func (h *handler) newTaskCard(item task.Task, csrf string, lookup func(string) (
 		Excerpt:     excerpt(item.Description),
 		Relative:    h.relativeTime(item.UpdatedAt),
 		Timestamp:   item.UpdatedAt.Format(time.RFC3339),
+	}
+	if item.Deleted() {
+		card.DeletedRelative = h.relativeTime(*item.DeletedAt)
+		card.DeletedTimestamp = item.DeletedAt.Format(time.RFC3339)
 	}
 	for _, dependency := range item.Dependencies {
 		view := dependencyView{ID: dependency, Title: dependency}

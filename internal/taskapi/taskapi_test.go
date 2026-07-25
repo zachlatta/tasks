@@ -90,6 +90,64 @@ func TestToolsAreSharedTaskOperations(t *testing.T) {
 	}
 }
 
+func TestDeleteAndRestoreTaskThroughToolsAndHandler(t *testing.T) {
+	t.Parallel()
+
+	repository := newAuditRepository()
+	service := task.NewService(repository, time.Now, func() string { return "disposable" })
+	tools := NewTools(service, readerFunc(func(context.Context, string) (postgres.Result, error) {
+		return postgres.Result{}, nil
+	}))
+	handler := NewHandler(tools)
+
+	if _, err := tools.CreateTask(context.Background(), CreateTaskInput{Title: "Disposable"}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	deleteResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deleteResponse, httptest.NewRequest(
+		http.MethodPost, "/api/tools/delete_task", strings.NewReader(`{"id":"disposable"}`),
+	))
+	if deleteResponse.Code != http.StatusOK || !strings.Contains(deleteResponse.Body.String(), `"deleted_at"`) {
+		t.Fatalf("delete response = %d %s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	if _, err := service.Get(context.Background(), "disposable"); !errors.Is(err, task.ErrNotFound) {
+		t.Fatalf("deleted task is still readable: %v", err)
+	}
+	if len(repository.mutations) != 2 ||
+		repository.mutations[1].Action != "delete" ||
+		repository.mutations[1].ActorKind != "shared_secret" ||
+		repository.mutations[1].Source != "cli" {
+		t.Fatalf("delete audit metadata = %#v", repository.mutations)
+	}
+
+	restoreResponse := httptest.NewRecorder()
+	handler.ServeHTTP(restoreResponse, httptest.NewRequest(
+		http.MethodPost, "/api/tools/restore_task", strings.NewReader(`{"id":"disposable"}`),
+	))
+	if restoreResponse.Code != http.StatusOK || strings.Contains(restoreResponse.Body.String(), `"deleted_at"`) {
+		t.Fatalf("restore response = %d %s", restoreResponse.Code, restoreResponse.Body.String())
+	}
+	restored, err := service.Get(context.Background(), "disposable")
+	if err != nil {
+		t.Fatalf("get restored task: %v", err)
+	}
+	if restored.Title != "Disposable" || restored.Deleted() {
+		t.Fatalf("restored task = %#v", restored)
+	}
+	if repository.mutations[2].Action != "restore" {
+		t.Fatalf("restore audit metadata = %#v", repository.mutations[2])
+	}
+
+	missing := httptest.NewRecorder()
+	handler.ServeHTTP(missing, httptest.NewRequest(
+		http.MethodPost, "/api/tools/delete_task", strings.NewReader(`{"id":"nobody"}`),
+	))
+	if missing.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("delete missing task response = %d %s", missing.Code, missing.Body.String())
+	}
+}
+
 func TestHandlerInvokesToolsAndReturnsEnvelopes(t *testing.T) {
 	t.Parallel()
 
@@ -169,6 +227,10 @@ func TestClientUsesSharedSecretAndTypedToolContract(t *testing.T) {
 			_, _ = io.WriteString(w, `{"data":{"columns":["id"],"rows":[{"id":"remote"}],"truncated":false}}`)
 		case "/api/tools/complete_task":
 			_, _ = io.WriteString(w, `{"data":{"id":"remote","title":"Updated","status":"done","version":3}}`)
+		case "/api/tools/delete_task":
+			_, _ = io.WriteString(w, `{"data":{"id":"remote","title":"Updated","status":"done","version":4,"deleted_at":"2026-07-24T12:00:00Z"}}`)
+		case "/api/tools/restore_task":
+			_, _ = io.WriteString(w, `{"data":{"id":"remote","title":"Updated","status":"done","version":5}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -196,7 +258,15 @@ func TestClientUsesSharedSecretAndTypedToolContract(t *testing.T) {
 	if err != nil || completed.Status != task.StatusDone {
 		t.Fatalf("CompleteTask = %#v, %v", completed, err)
 	}
-	if len(paths) != 4 {
+	deleted, err := client.DeleteTask(context.Background(), DeleteTaskInput{ID: created.ID})
+	if err != nil || !deleted.Deleted() {
+		t.Fatalf("DeleteTask = %#v, %v", deleted, err)
+	}
+	restored, err := client.RestoreTask(context.Background(), RestoreTaskInput{ID: created.ID})
+	if err != nil || restored.Deleted() {
+		t.Fatalf("RestoreTask = %#v, %v", restored, err)
+	}
+	if len(paths) != 6 {
 		t.Fatalf("paths = %v", paths)
 	}
 }

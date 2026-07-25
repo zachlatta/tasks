@@ -6,7 +6,7 @@ A small, self-hosted task manager with one shared Go backend and three interface
 - a secret-protected, drag-and-drop kanban web UI; and
 - an OAuth-protected MCP server over Streamable HTTP.
 
-Tasks live in PostgreSQL as the single source of truth. Every user-facing read goes through read-only SQL against those tables, while create/edit/start/move/complete operations go through the shared task service. Every successful mutation also appends an immutable before/after revision in the same database transaction.
+Tasks live in PostgreSQL as the single source of truth. Every user-facing read goes through read-only SQL against those tables, while create/edit/start/move/complete/delete operations go through the shared task service. Every successful mutation also appends an immutable before/after revision in the same database transaction. Deletion is always soft: a deleted task keeps its row and its whole history and can be restored unchanged.
 
 ## Quick start
 
@@ -39,6 +39,8 @@ tasks add [--description text] [--depends-on id,id] <title>
 tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--expected-version n] <task-id>
 tasks query <read-only-sql>
 tasks done <task-id>
+tasks delete <task-id>
+tasks restore <task-id>
 tasks serve
 tasks version
 ```
@@ -54,9 +56,15 @@ cat notes.md | tasks edit --description-file - <task-id>
 tasks edit --depends-on prerequisite-id,other-id <task-id>
 ```
 
+`tasks delete` soft-deletes a task and `tasks restore` brings it back. Deleted tasks are absent from `task_overview` and every other read; list them straight from the `tasks` table:
+
+```sh
+tasks query 'SELECT id, title, deleted_at FROM tasks WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC'
+```
+
 ## HTTP API
 
-The CLI calls `POST /api/tools/{name}` with `Authorization: Bearer <TASKS_SECRET>`. The available names mirror MCP: `query_tasks_sql`, `create_task`, `edit_task_text`, `update_task`, and `complete_task`. Inputs and successful `data` values use the same JSON types as the corresponding MCP tools:
+The CLI calls `POST /api/tools/{name}` with `Authorization: Bearer <TASKS_SECRET>`. The available names mirror MCP: `query_tasks_sql`, `create_task`, `edit_task_text`, `update_task`, `complete_task`, `delete_task`, and `restore_task`. Inputs and successful `data` values use the same JSON types as the corresponding MCP tools:
 
 ```sh
 curl -sS https://your-host.example/api/tools/create_task \
@@ -74,6 +82,7 @@ The homepage is a three-column board of **To do**, **In progress**, and **Done**
 - Drag a card to another column to change its status, or within a column to set its order by hand. Both are saved immediately, and a card dropped into **Done** ahead of its dependencies snaps back with the reason.
 - Cards are previews: title, a plain-text slice of the description, dependency and file counts, and a cover thumbnail of the first image. Click one for the full task in a slide-over panel; the URL follows, so the panel is shareable and the back button closes it.
 - In task detail, double-click the title or description to edit it in place. Press `Enter` to save a title, `⌘`/`Ctrl` + `Enter` to save a description, or `Escape` to cancel.
+- **Delete task** at the bottom of the detail takes a card off the board without a confirmation prompt, because it is reversible: the toast that follows offers an undo, and the board's `n deleted` link opens `/deleted`, where every deleted task can be read and restored to exactly where it was.
 - Every drag has a pointer-free equivalent. The `⋯` menu on each card moves it between columns, and focusing a card and holding `⌘`/`Ctrl` with the arrow keys moves it left, right, up, or down.
 - Without JavaScript the same board renders, the `⋯` menu posts an ordinary form, and cards open a full detail page. File attachments live on that detail view, images previewed inline and everything else as a download.
 
@@ -93,8 +102,12 @@ Available tools:
 - `query_tasks_sql`: arbitrary read-only PostgreSQL `SELECT`, `WITH`, or `EXPLAIN` queries, capped at 500 rows, including task revision history;
 - `create_task`: create a todo, optionally with dependency IDs;
 - `edit_task_text`: atomically apply one or more exact `old_text`/`new_text` replacements to a task title or description;
-- `update_task`: replace any supplied title, description, or complete dependency list; and
-- `complete_task`: mark a task done once its dependencies are done.
+- `update_task`: replace any supplied title, description, or complete dependency list;
+- `complete_task`: mark a task done once its dependencies are done;
+- `delete_task`: soft-delete a task; and
+- `restore_task`: return a soft-deleted task to the board.
+
+`delete_task` never removes data. It stamps `tasks.deleted_at`, which takes the task off the board and out of `task_overview`, the domain list, and every other operation; `restore_task` clears the stamp and the task comes back with its status, board position, text, dependencies, and files intact. Two guardrails keep live dependencies resolvable: a task other live tasks depend on cannot be deleted, and a task whose own dependencies are still deleted cannot be restored until they are. Both tools are idempotent.
 
 `edit_task_text` is intended for agent-authored contextual edits. Replacements run in order in one transaction. By default each `old_text` must occur exactly once; missing or ambiguous text fails the whole call, while `replace_all: true` explicitly replaces every occurrence. `update_task` is the whole-field equivalent: omitted fields remain unchanged, while empty description text or an empty dependency list clears the field. Both tools accept an optional `expected_version` from a prior query so a stale agent cannot overwrite a newer task. Dependency edits reject missing tasks and cycles.
 
@@ -109,17 +122,17 @@ ORDER BY table_name, ordinal_position;
 
 Each read runs inside a PostgreSQL `READ ONLY` transaction; the HTTP API and MCP layers also reject statements that do not begin with `SELECT`, `WITH`, or `EXPLAIN`. The intentionally small schema is:
 
-- `tasks(id, title, description, status, position, created_at, updated_at, version)`, where status is `todo`, `in_progress`, or `done` and `position` orders a column top to bottom
+- `tasks(id, title, description, status, position, created_at, updated_at, version, deleted_at)`, where status is `todo`, `in_progress`, or `done`, `position` orders a column top to bottom, and a non-null `deleted_at` marks a soft-deleted task
 - `dependencies(task_id, depends_on_id)`
 - `images(task_id, object_key, name, content_type)`
 - `task_revisions(revision_id, task_id, version, action, actor_kind, actor_id, source, request_id, occurred_at, before_state, after_state, metadata)`
-- `task_overview`: task columns plus `blocked`, `dependency_count`, and `image_count`
+- `task_overview`: task columns plus `blocked`, `dependency_count`, and `image_count`, for live tasks only
 
-`blocked` is `1` when at least one dependency is not done and `0` otherwise. Agents can discover the schema directly through `information_schema`; there are no non-SQL read tools.
+`blocked` is `1` when at least one dependency is not done and `0` otherwise. Deleted tasks are absent from `task_overview`; read them from `tasks` with `deleted_at IS NOT NULL`. Agents can discover the schema directly through `information_schema`; there are no non-SQL read tools.
 
 ## Revision history
 
-`task_revisions` is an append-only, Git-like history of successful task changes. Creating, editing, starting, completing, reopening, reordering, or attaching a file updates the current task and records one revision atomically, under the action `create`, `edit`, `start`, `complete`, `reopen`, `reorder`, or `add_attachment`. A failed or blocked operation records nothing; edits that produce no change, repeated completion on an already-done task, and dropping a card back where it came from are all no-ops. The rare `rebalance` action appears when a column's positions can no longer be split and are spread back out.
+`task_revisions` is an append-only, Git-like history of successful task changes. Creating, editing, starting, completing, reopening, reordering, attaching a file, deleting, or restoring updates the current task and records one revision atomically, under the action `create`, `edit`, `start`, `complete`, `reopen`, `reorder`, `add_attachment`, `delete`, or `restore`. A failed or blocked operation records nothing; edits that produce no change, repeated completion on an already-done task, deleting an already-deleted task, restoring a live one, and dropping a card back where it came from are all no-ops. The rare `rebalance` action appears when a column's positions can no longer be split and are spread back out.
 
 Each revision contains:
 
@@ -175,7 +188,7 @@ TASKS_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres?ssl
   make test
 ```
 
-Tests cover the domain service, PostgreSQL persistence, read-only SQL enforcement, shared-secret API auth, the CLI HTTP client, OAuth/PKCE, HTTP origin protection, MCP tools, CLI behavior, browser sessions, CSRF checks, and file uploads.
+Tests cover the domain service, PostgreSQL persistence and migrations, soft delete and restore, read-only SQL enforcement, shared-secret API auth, the CLI HTTP client, OAuth/PKCE, HTTP origin protection, MCP tools, CLI behavior, browser sessions, CSRF checks, and file uploads.
 
 ## Releases and Homebrew
 
@@ -199,5 +212,6 @@ The release workflows use only the repository-scoped `GITHUB_TOKEN`; no package 
 - The shared secret grants full task access. There are not yet per-user identities or separate read/write grants.
 - Public deployments should add reverse-proxy request throttling for the shared-secret API, login, registration, and authorization endpoints.
 - Attachments can be any file type up to 50 MiB. Local storage is for development; production can use an existing S3-compatible bucket.
+- Deletion is soft and has no purge. A deleted task keeps its row, attachments, and history until it is removed directly in PostgreSQL and the object store, which is deliberate: nothing an interface can do destroys task data.
 - Task revisions cover successful domain mutations, not reads, failed login attempts, or database-administrator activity. Deployments needing forensic change capture should stream PostgreSQL changes to an external immutable destination in addition to this application history.
 - The project does not yet declare an open-source license.

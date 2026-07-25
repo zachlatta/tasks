@@ -46,7 +46,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "help", "--help", "-h":
 		usage(stdout)
 		return 0
-	case "add", "edit", "query", "done", "serve":
+	case "add", "edit", "query", "done", "delete", "restore", "serve":
 		// These commands operate on stored tasks and need configuration below.
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n", args[0])
@@ -185,6 +185,30 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 			return 1
 		}
 		fmt.Fprintf(stdout, "completed %s\n", completed.ID)
+		return 0
+	case "delete":
+		if len(args) != 2 {
+			fmt.Fprintln(stderr, "Usage: tasks delete <task-id>")
+			return 2
+		}
+		deleted, err := client.DeleteTask(context.Background(), taskapi.DeleteTaskInput{ID: args[1]})
+		if err != nil {
+			fmt.Fprintf(stderr, "delete task: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "deleted %s\n", deleted.ID)
+		return 0
+	case "restore":
+		if len(args) != 2 {
+			fmt.Fprintln(stderr, "Usage: tasks restore <task-id>")
+			return 2
+		}
+		restored, err := client.RestoreTask(context.Background(), taskapi.RestoreTaskInput{ID: args[1]})
+		if err != nil {
+			fmt.Fprintf(stderr, "restore task: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "restored %s\n", restored.ID)
 		return 0
 	}
 	return 0
@@ -350,6 +374,8 @@ func usage(output io.Writer) {
   tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--expected-version n] <task-id>
   tasks query <read-only-sql>
   tasks done <task-id>
+  tasks delete <task-id>
+  tasks restore <task-id>
   tasks serve
   tasks version`)
 }

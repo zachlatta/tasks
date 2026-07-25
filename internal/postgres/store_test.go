@@ -647,6 +647,189 @@ func TestQueryOverviewRejectsWritesAndCaps(t *testing.T) {
 	}
 }
 
+func TestSoftDeleteHidesTaskFromProjectionsAndKeepsHistory(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := task.NewService(store, func() time.Time {
+		current := now
+		now = now.Add(time.Minute)
+		return current
+	}, func() string { return "disposable" })
+
+	created, err := service.Create(ctx, task.CreateInput{Title: "Disposable", Description: "Delete me"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	deleted, err := service.Delete(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if deleted.DeletedAt == nil {
+		t.Fatalf("deleted task = %#v, want a deletion timestamp", deleted)
+	}
+
+	// The board projection, the domain list, and task_overview all drop it.
+	board, err := store.Tasks(ctx)
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(board) != 0 {
+		t.Fatalf("board projection = %#v, want no tasks", board)
+	}
+	live, err := service.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(live) != 0 {
+		t.Fatalf("live tasks = %#v, want none", live)
+	}
+	overview, err := store.Query(ctx, "SELECT id FROM task_overview")
+	if err != nil {
+		t.Fatalf("query task_overview: %v", err)
+	}
+	if len(overview.Rows) != 0 {
+		t.Fatalf("task_overview rows = %#v, want none", overview.Rows)
+	}
+
+	// The row itself, its deletion stamp, and its history stay queryable.
+	rows, err := store.Query(ctx, "SELECT title, deleted_at FROM tasks WHERE id = 'disposable'")
+	if err != nil {
+		t.Fatalf("query stored task: %v", err)
+	}
+	if len(rows.Rows) != 1 || rows.Rows[0]["title"] != "Disposable" || rows.Rows[0]["deleted_at"] == nil {
+		t.Fatalf("stored row = %#v, want the task with a deleted_at", rows.Rows)
+	}
+	trashed, err := store.DeletedTasks(ctx)
+	if err != nil {
+		t.Fatalf("DeletedTasks: %v", err)
+	}
+	if len(trashed) != 1 || trashed[0].ID != created.ID || trashed[0].DeletedAt == nil {
+		t.Fatalf("deleted tasks = %#v, want the deleted task", trashed)
+	}
+	if trashed[0].Description != "Delete me" {
+		t.Fatalf("deleted task description = %q, want it preserved", trashed[0].Description)
+	}
+
+	restored, err := service.Restore(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if restored.DeletedAt != nil || restored.Status != task.StatusTodo {
+		t.Fatalf("restored task = %#v", restored)
+	}
+	board, err = store.Tasks(ctx)
+	if err != nil {
+		t.Fatalf("Tasks after restore: %v", err)
+	}
+	if len(board) != 1 || board[0].ID != created.ID || board[0].DeletedAt != nil {
+		t.Fatalf("board after restore = %#v", board)
+	}
+	if trashed, err = store.DeletedTasks(ctx); err != nil || len(trashed) != 0 {
+		t.Fatalf("deleted tasks after restore = %#v, %v", trashed, err)
+	}
+
+	history, err := store.Query(ctx, `
+		SELECT action, after_state
+		FROM task_revisions
+		WHERE task_id = 'disposable'
+		ORDER BY version
+	`)
+	if err != nil {
+		t.Fatalf("query revisions: %v", err)
+	}
+	actions := make([]string, 0, len(history.Rows))
+	for _, row := range history.Rows {
+		actions = append(actions, fmt.Sprint(row["action"]))
+	}
+	if want := []string{"create", "delete", "restore"}; !slices.Equal(actions, want) {
+		t.Fatalf("revision actions = %v, want %v", actions, want)
+	}
+	var deletedState task.Task
+	if err := decodeSnapshot(history.Rows[1]["after_state"], &deletedState); err != nil {
+		t.Fatalf("decode delete snapshot: %v", err)
+	}
+	if deletedState.DeletedAt == nil || deletedState.Title != "Disposable" {
+		t.Fatalf("delete snapshot = %#v", deletedState)
+	}
+}
+
+func TestOpenAddsSoftDeleteToExistingDatabase(t *testing.T) {
+	databaseURL := pgtest.URL(t)
+	ctx := context.Background()
+	connection, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect legacy database: %v", err)
+	}
+	// A database created before soft delete has no deleted_at column, and its
+	// task_overview view predates the filter that hides deleted tasks.
+	_, err = connection.Exec(ctx, `
+		CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT NOT NULL,
+			status TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			version BIGINT NOT NULL DEFAULT 1,
+			position DOUBLE PRECISION NOT NULL DEFAULT 0
+		);
+		CREATE TABLE dependencies (
+			task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			depends_on_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			PRIMARY KEY (task_id, depends_on_id)
+		);
+		CREATE TABLE images (
+			task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			object_key TEXT NOT NULL,
+			name TEXT NOT NULL,
+			content_type TEXT NOT NULL,
+			PRIMARY KEY (task_id, object_key)
+		);
+		CREATE VIEW task_overview AS
+		SELECT
+			t.id, t.title, t.description, t.status, t.created_at, t.updated_at,
+			0 AS blocked,
+			(SELECT count(*) FROM dependencies d WHERE d.task_id = t.id) AS dependency_count,
+			(SELECT count(*) FROM images i WHERE i.task_id = t.id) AS image_count,
+			t.version,
+			t.position
+		FROM tasks t;
+		INSERT INTO tasks (id, title, description, status, created_at, updated_at, position)
+		VALUES ('legacy', 'Predates soft delete', '', 'todo', now(), now(), 1024);
+	`)
+	connection.Close(ctx)
+	if err != nil {
+		t.Fatalf("seed legacy task: %v", err)
+	}
+
+	store, err := Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	service := task.NewService(store, time.Now, func() string { return "unused" })
+	if _, err := service.Delete(ctx, "legacy"); err != nil {
+		t.Fatalf("Delete a task stored before soft delete: %v", err)
+	}
+	if got, want := storedOrder(t, store, task.StatusTodo), []string{}; !slices.Equal(got, want) {
+		t.Fatalf("todo column after delete = %v, want %v", got, want)
+	}
+	overview, err := store.Query(ctx, "SELECT id FROM task_overview")
+	if err != nil {
+		t.Fatalf("query migrated task_overview: %v", err)
+	}
+	if len(overview.Rows) != 0 {
+		t.Fatalf("migrated task_overview rows = %#v, want the deleted task hidden", overview.Rows)
+	}
+	if _, err := service.Restore(ctx, "legacy"); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if got, want := storedOrder(t, store, task.StatusTodo), []string{"legacy"}; !slices.Equal(got, want) {
+		t.Fatalf("todo column after restore = %v, want %v", got, want)
+	}
+}
+
 func mustCreate(t *testing.T, store *Store, item task.Task) {
 	t.Helper()
 	if err := store.Create(context.Background(), item); err != nil {

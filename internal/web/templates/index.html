@@ -26,6 +26,7 @@
         <h2 id="board-heading">The board</h2>
       </div>
       <p class="board-hint">Drag a card anywhere on the board, or focus one and hold <kbd>⌘</kbd>/<kbd>Ctrl</kbd> with the arrow keys.</p>
+      {{if .DeletedCount}}<p class="board-deleted"><a href="/deleted">{{.DeletedCount}} deleted</a></p>{{end}}
       <label class="board-filter" for="board-filter">
         <span class="visually-hidden">Filter cards</span>
         <input id="board-filter" type="search" placeholder="Filter {{.TaskCount}} tasks" autocomplete="off">
