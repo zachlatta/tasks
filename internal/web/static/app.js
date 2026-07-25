@@ -77,6 +77,10 @@
     return { status: list.dataset.status, index: cardsIn(list).indexOf(card) };
   }
 
+  // The heading counts the work that is actually yours to do, so a card that is
+  // waiting on a person or a prerequisite is tallied beside it instead.
+  const isSleeping = (card) => card.dataset.sleeping === '1';
+
   function refresh() {
     if (!board) return;
     applyFilter();
@@ -84,10 +88,19 @@
       const list = column.querySelector('[data-dropzone]');
       if (!list) return;
       const visible = cardsIn(list).filter((card) => !card.hidden);
+      const awake = visible.filter((card) => !isSleeping(card));
+      const waiting = visible.length - awake.length;
       const count = column.querySelector('.column-count');
-      if (count) count.textContent = String(visible.length);
+      if (count) count.textContent = String(awake.length);
+      const label = column.querySelector('.column-waiting');
+      const toggle = column.querySelector('.waiting-toggle');
+      if (label) {
+        label.textContent = `${waiting} waiting`;
+        label.hidden = waiting === 0;
+        if (waiting === 0 && toggle) toggle.checked = false;
+      }
       const empty = list.querySelector('.column-empty');
-      if (empty) empty.hidden = visible.length > 0;
+      if (empty) empty.hidden = awake.length > 0;
     });
   }
 

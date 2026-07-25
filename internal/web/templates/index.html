@@ -25,7 +25,7 @@
         <p class="eyebrow">WORKFLOW</p>
         <h2 id="board-heading">The board</h2>
       </div>
-      <p class="board-hint">Drag a card anywhere on the board, or focus one and hold <kbd>⌘</kbd>/<kbd>Ctrl</kbd> with the arrow keys.</p>
+      <p class="board-hint">Showing the {{.ActionableTasks}} task{{if ne .ActionableTasks 1}}s{{end}} nobody else has to move first. Anything waiting on a person or a prerequisite is one click away, per column.</p>
       {{if .DeletedCount}}<p class="board-deleted"><a href="/deleted">{{.DeletedCount}} deleted</a></p>{{end}}
       <label class="board-filter" for="board-filter">
         <span class="visually-hidden">Filter cards</span>
@@ -36,13 +36,17 @@
     <div class="kanban-board" id="kanban-board" aria-labelledby="board-heading">
       {{range .Columns}}
       <section class="kanban-column" data-status="{{.Status}}" aria-labelledby="{{.Status}}-heading">
+        <!-- Unchecked, this hides the column's sleeping cards. They stay in the
+             list in board order so a drag still lands where the server expects. -->
+        <input class="waiting-toggle" type="checkbox" id="show-waiting-{{.Status}}">
         <header class="column-heading">
           <h2 id="{{.Status}}-heading"><span class="status-dot" aria-hidden="true"></span>{{.Label}}</h2>
-          <span class="column-count">{{len .Tasks}}</span>
+          <span class="column-count">{{.Awake}}</span>
+          <label class="column-waiting" for="show-waiting-{{.Status}}"{{if not .Waiting}} hidden{{end}}>{{.Waiting}} waiting</label>
         </header>
         <div class="column-task-list" data-status="{{.Status}}" data-dropzone aria-labelledby="{{.Status}}-heading">
           {{range .Tasks}}{{template "task-card" .}}{{end}}
-          <p class="column-empty"{{if .Tasks}} hidden{{end}}>{{.Empty}}</p>
+          <p class="column-empty"{{if .Awake}} hidden{{end}}>{{.Empty}}</p>
         </div>
       </section>
       {{end}}

@@ -4,6 +4,7 @@ package taskapi
 
 import (
 	"context"
+	"time"
 
 	"github.com/zachlatta/tasks/internal/postgres"
 	"github.com/zachlatta/tasks/internal/task"
@@ -38,6 +39,8 @@ type CreateTaskInput struct {
 	Title        string   `json:"title" jsonschema:"Short, required title for the task."`
 	Description  string   `json:"description,omitempty" jsonschema:"Optional Markdown task description."`
 	Dependencies []string `json:"dependencies,omitempty" jsonschema:"IDs of tasks that must be done first."`
+	WakeAt       string   `json:"wake_at,omitempty" jsonschema:"Optional date the task should return to the board, as YYYY-MM-DD (midnight UTC) or an RFC 3339 timestamp. Until then the task is captured but held off the board."`
+	WaitingOn    string   `json:"waiting_on,omitempty" jsonschema:"Optional one-line note naming who or what the task is waiting for."`
 }
 
 type CompleteTaskInput struct {
@@ -58,6 +61,8 @@ type UpdateTaskInput struct {
 	Title           *string   `json:"title,omitempty" jsonschema:"Optional complete replacement title. Whitespace is trimmed and the result must not be blank."`
 	Description     *string   `json:"description,omitempty" jsonschema:"Optional complete replacement Markdown description. An empty string clears it."`
 	Dependencies    *[]string `json:"dependencies,omitempty" jsonschema:"Optional complete replacement dependency ID list. An empty list clears all dependencies."`
+	WakeAt          *string   `json:"wake_at,omitempty" jsonschema:"Optional date the task should return to the board, as YYYY-MM-DD (midnight UTC) or an RFC 3339 timestamp. An empty string clears it and wakes the task now."`
+	WaitingOn       *string   `json:"waiting_on,omitempty" jsonschema:"Optional one-line note naming who or what the task is waiting for. An empty string clears it."`
 }
 
 type EditTaskTextInput struct {
@@ -86,8 +91,16 @@ func (t *Tools) QueryTasksSQL(ctx context.Context, input SQLQueryInput) (SQLQuer
 }
 
 func (t *Tools) CreateTask(ctx context.Context, input CreateTaskInput) (task.Task, error) {
+	wakeAt, err := task.ParseWakeAt(input.WakeAt)
+	if err != nil {
+		return task.Task{}, err
+	}
 	return t.tasks.Create(ctx, task.CreateInput{
-		Title: input.Title, Description: input.Description, Dependencies: input.Dependencies,
+		Title:        input.Title,
+		Description:  input.Description,
+		Dependencies: input.Dependencies,
+		WakeAt:       wakeAt,
+		WaitingOn:    input.WaitingOn,
 	})
 }
 
@@ -98,12 +111,26 @@ func (t *Tools) EditTaskText(ctx context.Context, input EditTaskTextInput) (task
 }
 
 func (t *Tools) UpdateTask(ctx context.Context, input UpdateTaskInput) (task.Task, error) {
-	return t.tasks.Edit(ctx, input.ID, task.EditInput{
+	edit := task.EditInput{
 		Title:           input.Title,
 		Description:     input.Description,
 		Dependencies:    input.Dependencies,
+		WaitingOn:       input.WaitingOn,
 		ExpectedVersion: input.ExpectedVersion,
-	})
+	}
+	if input.WakeAt != nil {
+		// A supplied empty string clears the date, which task.EditInput spells
+		// as the zero time.
+		wakeAt, err := task.ParseWakeAt(*input.WakeAt)
+		if err != nil {
+			return task.Task{}, err
+		}
+		if wakeAt == nil {
+			wakeAt = new(time.Time)
+		}
+		edit.WakeAt = wakeAt
+	}
+	return t.tasks.Edit(ctx, input.ID, edit)
 }
 
 func (t *Tools) CompleteTask(ctx context.Context, input CompleteTaskInput) (task.Task, error) {

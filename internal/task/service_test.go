@@ -745,3 +745,169 @@ func (r *memoryRepository) List(_ context.Context) ([]Task, error) {
 	}
 	return tasks, nil
 }
+
+func TestSnoozedReportsWhetherTheWakeDateHasArrived(t *testing.T) {
+	t.Parallel()
+
+	wake := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
+	item := Task{WakeAt: &wake}
+	if !item.Snoozed(wake.Add(-time.Minute)) {
+		t.Fatal("a task with a future wake date should be snoozed")
+	}
+	if item.Snoozed(wake) {
+		t.Fatal("a task should wake exactly at its wake date")
+	}
+	if item.Snoozed(wake.Add(time.Hour)) {
+		t.Fatal("a task past its wake date should be awake")
+	}
+	if (Task{}).Snoozed(wake) {
+		t.Fatal("a task with no wake date should never be snoozed")
+	}
+}
+
+func TestEditSetsAndClearsTheWait(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, func() time.Time { return now }, func() string { return "licence-signoff" })
+	created, err := service.Create(context.Background(), CreateInput{Title: "Priya, Tom & Rae sign off"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.WakeAt != nil || created.WaitingOn != "" || created.SnoozeCount != 0 {
+		t.Fatalf("new task should start awake, got %#v", created)
+	}
+
+	wake := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
+	waitingOn := "Priya, Tom & Rae (asked Mar 4)"
+	slept, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &wake, WaitingOn: &waitingOn})
+	if err != nil {
+		t.Fatalf("Edit to sleep: %v", err)
+	}
+	if slept.WakeAt == nil || !slept.WakeAt.Equal(wake) {
+		t.Fatalf("wake date = %v, want %v", slept.WakeAt, wake)
+	}
+	if slept.WaitingOn != waitingOn {
+		t.Fatalf("waiting on = %q, want %q", slept.WaitingOn, waitingOn)
+	}
+	if !slept.Snoozed(now) {
+		t.Fatal("task should be snoozed right after it is put to sleep")
+	}
+	if slept.SnoozeCount != 1 {
+		t.Fatalf("snooze count = %d, want 1", slept.SnoozeCount)
+	}
+
+	// Re-supplying the same wait changes nothing and must not count as a snooze.
+	same, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &wake, WaitingOn: &waitingOn})
+	if err != nil {
+		t.Fatalf("Edit with an unchanged wait: %v", err)
+	}
+	if same.Version != slept.Version || same.SnoozeCount != 1 {
+		t.Fatalf("unchanged wait bumped the task: version %d, snoozes %d", same.Version, same.SnoozeCount)
+	}
+
+	var cleared time.Time
+	empty := ""
+	awake, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &cleared, WaitingOn: &empty})
+	if err != nil {
+		t.Fatalf("Edit to wake: %v", err)
+	}
+	if awake.WakeAt != nil || awake.WaitingOn != "" {
+		t.Fatalf("clearing the wait left %#v", awake)
+	}
+	if awake.Snoozed(now) {
+		t.Fatal("a cleared wait should leave the task awake")
+	}
+	if awake.SnoozeCount != 0 {
+		t.Fatalf("snooze count = %d, want 0 after the wait is cleared", awake.SnoozeCount)
+	}
+}
+
+func TestRepeatedSnoozesAccumulate(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, func() time.Time { return now }, func() string { return "nudge-vendor" })
+	created, err := service.Create(context.Background(), CreateInput{Title: "Nudge the vendor"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for attempt := 1; attempt <= 3; attempt++ {
+		wake := now.AddDate(0, 0, attempt)
+		edited, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &wake})
+		if err != nil {
+			t.Fatalf("Edit snooze %d: %v", attempt, err)
+		}
+		if edited.SnoozeCount != attempt {
+			t.Fatalf("snooze count after %d snoozes = %d", attempt, edited.SnoozeCount)
+		}
+	}
+}
+
+func TestEditTrimsWaitingOn(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, func() time.Time { return now }, func() string { return "trim-wait" })
+	created, err := service.Create(context.Background(), CreateInput{Title: "Trim"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	padded := "  Priya Raman  "
+	edited, err := service.Edit(context.Background(), created.ID, EditInput{WaitingOn: &padded})
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if edited.WaitingOn != "Priya Raman" {
+		t.Fatalf("waiting on = %q, want trimmed", edited.WaitingOn)
+	}
+}
+
+func TestEditStoresTheWakeDateInUTC(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, func() time.Time { return now }, func() string { return "utc-wait" })
+	created, err := service.Create(context.Background(), CreateInput{Title: "UTC"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	zone := time.FixedZone("UTC-4", -4*60*60)
+	wake := time.Date(2026, time.July, 27, 9, 0, 0, 0, zone)
+	edited, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &wake})
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if edited.WakeAt.Location() != time.UTC || !edited.WakeAt.Equal(wake) {
+		t.Fatalf("wake date = %v, want the same instant in UTC", edited.WakeAt)
+	}
+}
+
+func TestEditClonesTheWakeDate(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, func() time.Time { return now }, func() string { return "clone-wait" })
+	created, err := service.Create(context.Background(), CreateInput{Title: "Clone"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	wake := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
+	edited, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &wake})
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	*edited.WakeAt = edited.WakeAt.AddDate(0, 0, 10)
+	reread, err := service.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !reread.WakeAt.Equal(wake) {
+		t.Fatalf("stored wake date = %v, want %v; the pointer is shared", reread.WakeAt, wake)
+	}
+}

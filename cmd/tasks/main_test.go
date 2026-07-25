@@ -314,3 +314,72 @@ func TestCLIEditRejectsConflictingDescriptionInputs(t *testing.T) {
 		t.Fatalf("stderr = %q", errors.String())
 	}
 }
+
+func TestCLIAddAndEditCarryTheWait(t *testing.T) {
+	const secret = "test-secret"
+	var created struct {
+		WakeAt    string `json:"wake_at"`
+		WaitingOn string `json:"waiting_on"`
+	}
+	var edited struct {
+		WakeAt    *string `json:"wake_at"`
+		WaitingOn *string `json:"waiting_on"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/tools/create_task":
+			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+				t.Errorf("decode create input: %v", err)
+			}
+			_, _ = io.WriteString(w, `{"data":{"id":"waiting-task","version":1}}`)
+		case "/api/tools/update_task":
+			if err := json.NewDecoder(r.Body).Decode(&edited); err != nil {
+				t.Errorf("decode update input: %v", err)
+			}
+			_, _ = io.WriteString(w, `{"data":{"id":"waiting-task","version":2}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("TASKS_API_URL", server.URL)
+	t.Setenv("TASKS_SECRET", secret)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{
+		"add", "--waiting-on", "Priya, Tom & Rae", "--wake-at", "2026-07-27", "Chase the sign-off",
+	}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("add exit code = %d; stderr: %s", code, stderr.String())
+	}
+	if created.WakeAt != "2026-07-27" || created.WaitingOn != "Priya, Tom & Rae" {
+		t.Fatalf("add sent %#v", created)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{
+		"edit", "--wake-at", "", "--waiting-on", "", "waiting-task",
+	}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("edit exit code = %d; stderr: %s", code, stderr.String())
+	}
+	if edited.WakeAt == nil || *edited.WakeAt != "" || edited.WaitingOn == nil || *edited.WaitingOn != "" {
+		t.Fatalf("edit sent %#v", edited)
+	}
+}
+
+func TestCLIEditAcceptsTheWaitAlone(t *testing.T) {
+	const secret = "test-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"id":"waiting-task","version":2}}`)
+	}))
+	defer server.Close()
+	t.Setenv("TASKS_API_URL", server.URL)
+	t.Setenv("TASKS_SECRET", secret)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"edit", "--wake-at", "2026-08-03", "waiting-task"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("edit exit code = %d; stderr: %s", code, stderr.String())
+	}
+}

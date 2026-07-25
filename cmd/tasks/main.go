@@ -84,12 +84,18 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		flags.SetOutput(stderr)
 		description := flags.String("description", "", "Markdown description")
 		dependencies := flags.String("depends-on", "", "comma-separated dependency task IDs")
+		wakeAt := flags.String("wake-at", "", "hold the task off the board until this date (YYYY-MM-DD or RFC 3339)")
+		waitingOn := flags.String("waiting-on", "", "one line naming who or what the task is waiting for")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}
 		title := strings.Join(flags.Args(), " ")
 		created, err := client.CreateTask(context.Background(), taskapi.CreateTaskInput{
-			Title: title, Description: *description, Dependencies: strings.Split(*dependencies, ","),
+			Title:        title,
+			Description:  *description,
+			Dependencies: strings.Split(*dependencies, ","),
+			WakeAt:       *wakeAt,
+			WaitingOn:    *waitingOn,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "add task: %v\n", err)
@@ -104,25 +110,29 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		var description optionalString
 		var descriptionFile optionalString
 		var dependencies optionalString
+		var wakeAt optionalString
+		var waitingOn optionalString
 		var expectedVersion optionalPositiveInt64
 		flags.Var(&title, "title", "complete replacement title")
 		flags.Var(&description, "description", "complete replacement Markdown description")
 		flags.Var(&descriptionFile, "description-file", "read replacement Markdown description from a file, or - for stdin")
 		flags.Var(&dependencies, "depends-on", "complete replacement comma-separated dependency task IDs; empty clears")
+		flags.Var(&wakeAt, "wake-at", "hold the task off the board until this date (YYYY-MM-DD or RFC 3339); empty wakes it now")
+		flags.Var(&waitingOn, "waiting-on", "one line naming who or what the task is waiting for; empty clears")
 		flags.Var(&expectedVersion, "expected-version", "fail if the stored task version differs")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}
 		if len(flags.Args()) != 1 {
-			fmt.Fprintln(stderr, "Usage: tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--expected-version n] <task-id>")
+			fmt.Fprintln(stderr, "Usage: tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--expected-version n] <task-id>")
 			return 2
 		}
 		if description.set && descriptionFile.set {
 			fmt.Fprintln(stderr, "edit task: --description and --description-file cannot be used together")
 			return 2
 		}
-		if !title.set && !description.set && !descriptionFile.set && !dependencies.set {
-			fmt.Fprintln(stderr, "edit task: at least one of --title, --description, --description-file, or --depends-on is required")
+		if !title.set && !description.set && !descriptionFile.set && !dependencies.set && !wakeAt.set && !waitingOn.set {
+			fmt.Fprintln(stderr, "edit task: at least one of --title, --description, --description-file, --depends-on, --wake-at, or --waiting-on is required")
 			return 2
 		}
 
@@ -144,6 +154,12 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		if dependencies.set {
 			values := strings.Split(dependencies.value, ",")
 			input.Dependencies = &values
+		}
+		if wakeAt.set {
+			input.WakeAt = &wakeAt.value
+		}
+		if waitingOn.set {
+			input.WaitingOn = &waitingOn.value
 		}
 		if expectedVersion.set {
 			input.ExpectedVersion = &expectedVersion.value
@@ -370,8 +386,8 @@ func readTextInput(stdin io.Reader, path string) (string, error) {
 
 func usage(output io.Writer) {
 	fmt.Fprintln(output, `Usage:
-  tasks add [--description text] [--depends-on id,id] <title>
-  tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--expected-version n] <task-id>
+  tasks add [--description text] [--depends-on id,id] [--wake-at date] [--waiting-on text] <title>
+  tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--expected-version n] <task-id>
   tasks query <read-only-sql>
   tasks done <task-id>
   tasks delete <task-id>

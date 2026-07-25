@@ -35,18 +35,21 @@ func NewWithTools(tools *taskapi.Tools, version string) *mcp.Server {
 	}, nil)
 	closedWorld := false
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        taskapi.QueryTasksSQLTool,
-		Title:       "Query tasks with read-only SQL",
-		Description: "Runs trusted, read-only PostgreSQL queries. Tables: tasks, dependencies, images, task_revisions. View: task_overview. Results are capped at 500 rows. Inspect the schema via information_schema.columns.",
+		Name:  taskapi.QueryTasksSQLTool,
+		Title: "Query tasks with read-only SQL",
+		Description: "Runs trusted, read-only PostgreSQL queries. Tables: tasks, dependencies, images, task_revisions. " +
+			"View: task_overview, which adds blocked, snoozed, and sleeping flags plus wake_at, waiting_on, and snooze_count. " +
+			"Results are capped at 500 rows. Inspect the schema via information_schema.columns.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input SQLQueryInput) (*mcp.CallToolResult, SQLQueryOutput, error) {
 		output, err := tools.QueryTasksSQL(ctx, input)
 		return nil, output, err
 	})
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        taskapi.CreateTaskTool,
-		Title:       "Create a task",
-		Description: "Creates a todo task in the shared Postgres backend. Dependencies must name existing task IDs.",
+		Name:  taskapi.CreateTaskTool,
+		Title: "Create a task",
+		Description: "Creates a todo task in the shared Postgres backend. Dependencies must name existing task IDs. " +
+			"Set wake_at and waiting_on to capture work that is already waiting on someone; it stays off the board until that date arrives.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPointer(false), OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input CreateTaskInput) (*mcp.CallToolResult, task.Task, error) {
 		created, err := tools.CreateTask(mutationContext(ctx), input)
@@ -66,8 +69,10 @@ func NewWithTools(tools *taskapi.Tools, version string) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:  taskapi.UpdateTaskTool,
 		Title: "Replace task fields",
-		Description: "Atomically replaces any supplied mutable fields: title, description, and/or the complete dependency list. " +
-			"Omitted fields stay unchanged; an empty description or dependency list clears that field. " +
+		Description: "Atomically replaces any supplied mutable fields: title, description, the complete dependency list, " +
+			"and/or the wait (wake_at and waiting_on). " +
+			"Omitted fields stay unchanged; an empty description, dependency list, wake date, or waiting-on note clears that field. " +
+			"A task with a future wake_at or an unfinished dependency is held off the board until it wakes. " +
 			"Status and attachments are preserved. Use query_tasks_sql to read the current task and version first.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPointer(true), OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input UpdateTaskInput) (*mcp.CallToolResult, task.Task, error) {

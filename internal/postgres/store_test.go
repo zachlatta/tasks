@@ -1142,3 +1142,171 @@ func storedOrder(t *testing.T, store *Store, status task.Status) []string {
 	}
 	return ids
 }
+
+func TestStoreRoundTripsTheWait(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := task.NewService(store, func() time.Time { return now }, func() string { return "licence-signoff" })
+
+	created, err := service.Create(ctx, task.CreateInput{Title: "Priya, Tom & Rae sign off"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	wake := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
+	waitingOn := "Priya, Tom & Rae (asked Mar 4)"
+	if _, err := service.Edit(ctx, created.ID, task.EditInput{WakeAt: &wake, WaitingOn: &waitingOn}); err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+
+	loaded, err := store.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if loaded.WakeAt == nil || !loaded.WakeAt.Equal(wake) || loaded.WakeAt.Location() != time.UTC {
+		t.Fatalf("wake date = %v, want %v in UTC", loaded.WakeAt, wake)
+	}
+	if loaded.WaitingOn != waitingOn || loaded.SnoozeCount != 1 {
+		t.Fatalf("waiting on = %q, snoozes = %d", loaded.WaitingOn, loaded.SnoozeCount)
+	}
+
+	listed, err := store.Tasks(ctx)
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	if len(listed) != 1 || listed[0].WakeAt == nil || !listed[0].WakeAt.Equal(wake) || listed[0].WaitingOn != waitingOn {
+		t.Fatalf("board projection dropped the wait: %#v", listed)
+	}
+
+	var cleared time.Time
+	if _, err := service.Edit(ctx, created.ID, task.EditInput{WakeAt: &cleared}); err != nil {
+		t.Fatalf("Edit to clear: %v", err)
+	}
+	awake, err := store.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Get after clearing: %v", err)
+	}
+	if awake.WakeAt != nil || awake.SnoozeCount != 0 {
+		t.Fatalf("clearing the wait left %#v", awake)
+	}
+}
+
+func TestTaskOverviewReportsSleepingTasks(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	ids := []string{"reviewer", "sender", "snoozed"}
+	service := task.NewService(store, func() time.Time { return now }, func() string {
+		id := ids[0]
+		ids = ids[1:]
+		return id
+	})
+
+	reviewer, err := service.Create(ctx, task.CreateInput{Title: "Someone else reviews"})
+	if err != nil {
+		t.Fatalf("Create reviewer: %v", err)
+	}
+	if _, err := service.Create(ctx, task.CreateInput{
+		Title: "Send the update", Dependencies: []string{reviewer.ID},
+	}); err != nil {
+		t.Fatalf("Create sender: %v", err)
+	}
+	snoozed, err := service.Create(ctx, task.CreateInput{Title: "Nudge later"})
+	if err != nil {
+		t.Fatalf("Create snoozed: %v", err)
+	}
+	// Far enough out that the view's own clock still reads it as asleep.
+	wake := time.Now().UTC().AddDate(0, 0, 30)
+	waitingOn := "the vendor"
+	if _, err := service.Edit(ctx, snoozed.ID, task.EditInput{WakeAt: &wake, WaitingOn: &waitingOn}); err != nil {
+		t.Fatalf("Edit snoozed: %v", err)
+	}
+
+	result, err := store.Query(ctx, `
+		SELECT id, blocked, snoozed, sleeping, waiting_on, snooze_count
+		FROM task_overview ORDER BY id
+	`)
+	if err != nil {
+		t.Fatalf("query task_overview: %v", err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("row count = %d, want 3", len(result.Rows))
+	}
+	byID := make(map[string]map[string]any, len(result.Rows))
+	for _, row := range result.Rows {
+		byID[fmt.Sprint(row["id"])] = row
+	}
+	for _, want := range []struct {
+		id       string
+		blocked  string
+		snoozed  string
+		sleeping string
+	}{
+		{id: "reviewer", blocked: "0", snoozed: "0", sleeping: "0"},
+		{id: "sender", blocked: "1", snoozed: "0", sleeping: "1"},
+		{id: "snoozed", blocked: "0", snoozed: "1", sleeping: "1"},
+	} {
+		row, ok := byID[want.id]
+		if !ok {
+			t.Fatalf("task_overview is missing %s", want.id)
+		}
+		if got := fmt.Sprint(row["blocked"]); got != want.blocked {
+			t.Errorf("%s blocked = %s, want %s", want.id, got, want.blocked)
+		}
+		if got := fmt.Sprint(row["snoozed"]); got != want.snoozed {
+			t.Errorf("%s snoozed = %s, want %s", want.id, got, want.snoozed)
+		}
+		if got := fmt.Sprint(row["sleeping"]); got != want.sleeping {
+			t.Errorf("%s sleeping = %s, want %s", want.id, got, want.sleeping)
+		}
+	}
+	if got := fmt.Sprint(byID["snoozed"]["waiting_on"]); got != "the vendor" {
+		t.Errorf("waiting_on = %q, want the vendor", got)
+	}
+	if got := fmt.Sprint(byID["snoozed"]["snooze_count"]); got != "1" {
+		t.Errorf("snooze_count = %s, want 1", got)
+	}
+}
+
+func TestOpenAddsWaitColumnsToAnExistingDatabase(t *testing.T) {
+	ctx := context.Background()
+	databaseURL := pgtest.URL(t)
+
+	// Build the tasks table as it existed before waits, then let Open migrate it.
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT NOT NULL,
+			status TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			version BIGINT NOT NULL DEFAULT 1,
+			position DOUBLE PRECISION NOT NULL DEFAULT 0
+		);
+		INSERT INTO tasks (id, title, description, status, created_at, updated_at)
+		VALUES ('legacy', 'Stored before waits existed', '', 'todo', now(), now());
+	`); err != nil {
+		conn.Close(ctx)
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	store, err := Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(store.Close)
+
+	loaded, err := store.Get(ctx, "legacy")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if loaded.WakeAt != nil || loaded.WaitingOn != "" || loaded.SnoozeCount != 0 {
+		t.Fatalf("migrated task should be awake, got %#v", loaded)
+	}
+}

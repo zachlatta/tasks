@@ -1297,3 +1297,262 @@ func TestExcerptFlattensMarkdownForCards(t *testing.T) {
 		t.Fatalf("excerpt did not truncate a long description: %q", shortened)
 	}
 }
+
+func TestBoardHoldsSleepingTasksOutOfTheQueue(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "reviewer", "sender", "snoozed")
+	ctx := context.Background()
+	if _, err := service.Create(ctx, task.CreateInput{Title: "Someone else reviews"}); err != nil {
+		t.Fatalf("create reviewer: %v", err)
+	}
+	if _, err := service.Create(ctx, task.CreateInput{
+		Title: "Send the update", Dependencies: []string{"reviewer"},
+	}); err != nil {
+		t.Fatalf("create sender: %v", err)
+	}
+	if _, err := service.Create(ctx, task.CreateInput{Title: "Nudge later"}); err != nil {
+		t.Fatalf("create snoozed: %v", err)
+	}
+	wake := time.Now().UTC().AddDate(0, 0, 3)
+	waitingOn := "the vendor"
+	if _, err := service.Edit(ctx, "snoozed", task.EditInput{WakeAt: &wake, WaitingOn: &waitingOn}); err != nil {
+		t.Fatalf("put the task to sleep: %v", err)
+	}
+
+	cookie, _ := login(t, handler)
+	page := get(t, handler, "/", cookie)
+	if page.Code != http.StatusOK {
+		t.Fatalf("index status = %d", page.Code)
+	}
+	column := findKanbanColumn(t, page.Body.String(), task.StatusTodo)
+
+	for _, id := range []string{"sender", "snoozed"} {
+		card := findTaskCard(t, column, id)
+		if !strings.Contains(card, `data-sleeping="1"`) {
+			t.Errorf("card %s should be marked asleep; got: %s", id, card)
+		}
+	}
+	awake := findTaskCard(t, column, "reviewer")
+	if strings.Contains(awake, `data-sleeping="1"`) {
+		t.Errorf("an actionable card should not be marked asleep; got: %s", awake)
+	}
+	if !strings.Contains(awake, `data-sleeping="0"`) {
+		t.Errorf("every card should declare whether it is asleep; got: %s", awake)
+	}
+
+	if !strings.Contains(column, "2 waiting") {
+		t.Errorf("the To do column should report 2 waiting cards; got: %s", column)
+	}
+	// The count beside the column heading is the size of the actionable queue.
+	count := regexp.MustCompile(`<span class="column-count">(\d+)</span>`).FindStringSubmatch(column)
+	if count == nil || count[1] != "1" {
+		t.Errorf("column count = %v, want 1 actionable card; got: %s", count, column)
+	}
+	if !strings.Contains(findTaskCard(t, column, "snoozed"), "the vendor") {
+		t.Error("a sleeping card should name who it is waiting on")
+	}
+}
+
+func TestBoardMarksWhyATaskCameBack(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "reviewer", "sender", "woken")
+	ctx := context.Background()
+	if _, err := service.Create(ctx, task.CreateInput{Title: "Someone else reviews"}); err != nil {
+		t.Fatalf("create reviewer: %v", err)
+	}
+	if _, err := service.Create(ctx, task.CreateInput{
+		Title: "Send the update", Dependencies: []string{"reviewer"},
+	}); err != nil {
+		t.Fatalf("create sender: %v", err)
+	}
+	if _, err := service.Create(ctx, task.CreateInput{Title: "Nudge the vendor"}); err != nil {
+		t.Fatalf("create woken: %v", err)
+	}
+	past := time.Now().UTC().AddDate(0, 0, -2)
+	waitingOn := "the vendor"
+	if _, err := service.Edit(ctx, "woken", task.EditInput{WakeAt: &past, WaitingOn: &waitingOn}); err != nil {
+		t.Fatalf("set an elapsed wake date: %v", err)
+	}
+	if _, err := service.Complete(ctx, "reviewer"); err != nil {
+		t.Fatalf("complete the prerequisite: %v", err)
+	}
+
+	cookie, _ := login(t, handler)
+	column := findKanbanColumn(t, get(t, handler, "/", cookie).Body.String(), task.StatusTodo)
+
+	woken := findTaskCard(t, column, "woken")
+	if strings.Contains(woken, `data-sleeping="1"`) {
+		t.Errorf("a task past its wake date should be awake; got: %s", woken)
+	}
+	if !strings.Contains(woken, "Woke") {
+		t.Errorf("a task whose timer fired should say so; got: %s", woken)
+	}
+	unblocked := findTaskCard(t, column, "sender")
+	if strings.Contains(unblocked, `data-sleeping="1"`) {
+		t.Errorf("a task whose dependencies are done should be awake; got: %s", unblocked)
+	}
+	if !strings.Contains(unblocked, "Unblocked") {
+		t.Errorf("a task released by its dependencies should say so; got: %s", unblocked)
+	}
+}
+
+func TestBoardFlagsAWaitThatKeepsSlipping(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "slipping")
+	ctx := context.Background()
+	if _, err := service.Create(ctx, task.CreateInput{Title: "Chase the signature"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for day := 1; day <= 3; day++ {
+		wake := time.Now().UTC().AddDate(0, 0, day)
+		if _, err := service.Edit(ctx, "slipping", task.EditInput{WakeAt: &wake}); err != nil {
+			t.Fatalf("snooze %d: %v", day, err)
+		}
+	}
+
+	cookie, _ := login(t, handler)
+	column := findKanbanColumn(t, get(t, handler, "/", cookie).Body.String(), task.StatusTodo)
+	card := findTaskCard(t, column, "slipping")
+	if !strings.Contains(card, "Snoozed 3×") {
+		t.Errorf("a thrice-snoozed card should show its tally; got: %s", card)
+	}
+}
+
+func TestDetailEditsTheWait(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandler(t)
+	created, err := service.Create(context.Background(), task.CreateInput{Title: "Wait on someone"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+
+	sleep := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
+		"csrf":             {csrf},
+		"field":            {"wake_at"},
+		"value":            {"2099-07-27"},
+		"expected_version": {"1"},
+	}, cookie)
+	if sleep.Code != http.StatusSeeOther {
+		t.Fatalf("wake_at edit status = %d; body: %s", sleep.Code, sleep.Body.String())
+	}
+	wait := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
+		"csrf":             {csrf},
+		"field":            {"waiting_on"},
+		"value":            {"Priya, Tom & Rae"},
+		"expected_version": {"2"},
+	}, cookie)
+	if wait.Code != http.StatusSeeOther {
+		t.Fatalf("waiting_on edit status = %d; body: %s", wait.Code, wait.Body.String())
+	}
+
+	stored, err := service.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	want := time.Date(2099, time.July, 27, 0, 0, 0, 0, time.UTC)
+	if stored.WakeAt == nil || !stored.WakeAt.Equal(want) {
+		t.Fatalf("wake date = %v, want %v", stored.WakeAt, want)
+	}
+	if stored.WaitingOn != "Priya, Tom & Rae" {
+		t.Fatalf("waiting on = %q", stored.WaitingOn)
+	}
+
+	detail := get(t, handler, "/"+created.ID, cookie)
+	body := detail.Body.String()
+	if !strings.Contains(body, `class="wait-editor`) {
+		t.Fatalf("detail page is missing the wait editor; body: %s", body)
+	}
+	for _, field := range []string{`value="wake_at"`, `value="waiting_on"`} {
+		if !strings.Contains(body, field) {
+			t.Fatalf("wait editor cannot edit %s; body: %s", field, body)
+		}
+	}
+	if !strings.Contains(body, "Priya, Tom &amp; Rae") {
+		t.Fatalf("detail page should show who the task waits on; body: %s", body)
+	}
+
+	// Clearing the date returns the task to the board.
+	clear := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
+		"csrf":             {csrf},
+		"field":            {"wake_at"},
+		"value":            {""},
+		"expected_version": {"3"},
+	}, cookie)
+	if clear.Code != http.StatusSeeOther {
+		t.Fatalf("clearing status = %d; body: %s", clear.Code, clear.Body.String())
+	}
+	awake, err := service.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get after clearing: %v", err)
+	}
+	if awake.WakeAt != nil {
+		t.Fatalf("wake date = %v, want cleared", awake.WakeAt)
+	}
+}
+
+func TestDetailRejectsAnUnparsableWakeDate(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandler(t)
+	created, err := service.Create(context.Background(), task.CreateInput{Title: "Bad date"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+	response := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
+		"csrf":             {csrf},
+		"field":            {"wake_at"},
+		"value":            {"next tuesday"},
+		"expected_version": {"1"},
+	}, cookie)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+}
+
+func TestSnoozeButtonsSetAWakeDate(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandler(t)
+	created, err := service.Create(context.Background(), task.CreateInput{Title: "Snooze me"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+	before := time.Now().UTC()
+	response := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
+		"csrf":             {csrf},
+		"field":            {"wake_at"},
+		"days":             {"3"},
+		"expected_version": {"1"},
+	}, cookie)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d; body: %s", response.Code, response.Body.String())
+	}
+	stored, err := service.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.WakeAt == nil {
+		t.Fatal("a relative snooze should set a wake date")
+	}
+	earliest, latest := before.AddDate(0, 0, 3), time.Now().UTC().AddDate(0, 0, 3).Add(time.Minute)
+	if stored.WakeAt.Before(earliest) || stored.WakeAt.After(latest) {
+		t.Fatalf("wake date = %v, want roughly 3 days out", stored.WakeAt)
+	}
+}
+
+func findTaskCard(t *testing.T, body, id string) string {
+	t.Helper()
+	pattern := `(?s)<article class="task-card"[^>]*data-task-id="` + regexp.QuoteMeta(id) + `".*?</article>`
+	card := regexp.MustCompile(pattern).FindString(body)
+	if card == "" {
+		t.Fatalf("task card %q not found in body: %s", id, body)
+	}
+	return card
+}

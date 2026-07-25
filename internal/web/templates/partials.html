@@ -15,13 +15,19 @@
   </form>
 </header>{{end}}
 
-{{define "task-card"}}<article class="task-card" data-task-id="{{.ID}}" data-status="{{.Status}}" draggable="true" tabindex="0" aria-label="{{plainTitle .Title}}, {{.StatusLabel}}">
+{{define "task-card"}}<article class="task-card" data-task-id="{{.ID}}" data-status="{{.Status}}" data-sleeping="{{if .Sleeping}}1{{else}}0{{end}}" draggable="true" tabindex="0" aria-label="{{plainTitle .Title}}, {{.StatusLabel}}{{if .Sleeping}}, waiting{{end}}">
   <a class="card-title" href="/{{.ID}}" draggable="false">{{renderInlineMarkdown .Title}}</a>
   {{with .Excerpt}}<p class="card-excerpt">{{.}}</p>{{end}}
   {{with .Cover}}<img class="card-cover" src="/attachments/{{.Key}}" alt="" loading="lazy" draggable="false">{{end}}
+  {{if or .WaitingOn .Sleeping .Woke .Unblocked}}<p class="card-wait">
+    {{if .Sleeping}}{{if .Blocked}}<span class="chip chip-blocked">Blocked</span>{{end}}{{if .WakeLabel}}<span class="chip chip-waiting">Until {{.WakeLabel}}</span>{{end}}
+    {{else}}{{if .Woke}}<span class="chip chip-woke">Woke {{.WakeLabel}}</span>{{end}}{{if .Unblocked}}<span class="chip chip-woke">Unblocked</span>{{end}}{{end}}
+    {{if .StaleWait}}<span class="chip chip-stale">Snoozed {{.SnoozeCount}}×</span>{{end}}
+    {{with .WaitingOn}}<span class="wait-who">{{.}}</span>{{end}}
+  </p>{{end}}
   <div class="card-meta">
     <code class="task-id">{{.ID}}</code>
-    {{if .Blocked}}<span class="chip chip-blocked">Blocked</span>{{end}}
+    {{if and .Blocked (not .Sleeping)}}<span class="chip chip-blocked">Blocked</span>{{end}}
     {{if .DependsOn}}<span class="chip">{{len .DependsOn}} dep{{if gt (len .DependsOn) 1}}s{{end}}</span>{{end}}
     {{if .Attachments}}<span class="chip">{{len .Attachments}} file{{if gt (len .Attachments) 1}}s{{end}}</span>{{end}}
     <time class="card-time" datetime="{{.Timestamp}}">{{.Relative}}</time>
@@ -60,6 +66,50 @@
     <span class="field-label">Move to</span>
     {{range .Moves}}<button class="ghost" type="submit" name="status" value="{{.Status}}">{{.Label}}</button>{{end}}
   </form>
+
+  <section class="wait-editor{{if .Sleeping}} is-waiting{{end}}">
+    <h3>Waiting</h3>
+    {{if .Sleeping}}<p class="wait-state">Off the board{{if .WakeLabel}} until <strong>{{.WakeLabel}}</strong>{{end}}{{if .Blocked}}{{if .WakeLabel}}, and{{else}} until{{end}} its dependencies are done{{end}}.</p>
+    {{else if .Woke}}<p class="wait-state">Back on the board — the wait ended <strong>{{.WakeLabel}}</strong>.</p>
+    {{else}}<p class="wait-state">Nothing is holding this back. It is yours to do now.</p>{{end}}
+    {{if .StaleWait}}<p class="wait-stale">Pushed out {{.SnoozeCount}} times. Escalate it, go ahead without them, or drop it.</p>{{end}}
+
+    <form class="wait-who-form" method="post" action="/tasks/{{.ID}}/edit">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="field" value="waiting_on">
+      <input type="hidden" name="expected_version" value="{{.Version}}">
+      <label class="field-label" for="waiting-on-{{.ID}}">Waiting on <span>who or what</span></label>
+      <div class="inline-actions">
+        <input id="waiting-on-{{.ID}}" name="value" value="{{.WaitingOn}}" autocomplete="off" placeholder="Priya, Tom &amp; Rae (asked Mar 4)">
+        <button class="small" type="submit">Save</button>
+      </div>
+    </form>
+
+    <form class="wait-date-form" method="post" action="/tasks/{{.ID}}/edit">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="field" value="wake_at">
+      <input type="hidden" name="expected_version" value="{{.Version}}">
+      <label class="field-label" for="wake-at-{{.ID}}">Check back on</label>
+      <div class="inline-actions">
+        <input id="wake-at-{{.ID}}" type="date" name="value" value="{{.WakeInput}}">
+        <button class="small" type="submit">Save</button>
+      </div>
+      <div class="wait-quick">
+        <span class="field-label">or in</span>
+        <button class="ghost small" type="submit" name="days" value="1">1 day</button>
+        <button class="ghost small" type="submit" name="days" value="3">3 days</button>
+        <button class="ghost small" type="submit" name="days" value="7">a week</button>
+      </div>
+    </form>
+
+    {{if .WakeLabel}}<form class="wait-clear-form" method="post" action="/tasks/{{.ID}}/edit">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="field" value="wake_at">
+      <input type="hidden" name="expected_version" value="{{.Version}}">
+      <input type="hidden" name="value" value="">
+      <button class="ghost small" type="submit">End the wait — put it back on the board</button>
+    </form>{{end}}
+  </section>
 
   <div class="editable-field editable-description" data-edit-field="description">
     <div class="editable-display" data-edit-display tabindex="0" title="Double-click to edit">

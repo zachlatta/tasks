@@ -35,8 +35,8 @@ The server creates the schema (`tasks`, `dependencies`, `images`, and the `task_
 ## CLI
 
 ```text
-tasks add [--description text] [--depends-on id,id] <title>
-tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--expected-version n] <task-id>
+tasks add [--description text] [--depends-on id,id] [--wake-at date] [--waiting-on text] <title>
+tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--expected-version n] <task-id>
 tasks query <read-only-sql>
 tasks done <task-id>
 tasks delete <task-id>
@@ -48,6 +48,8 @@ tasks version
 The CLI has no `list` or `show` shortcut. Every user-facing read goes through read-only SQL on the server and is returned as structured JSON. The web UI uses fixed SQL against the same projection, while mutations from every interface still go through `internal/task.Service`. The CLI never receives or opens `TASKS_DATABASE_URL`.
 
 `tasks edit` replaces only the fields named by flags. Use `--description-file` for longer Markdown; `-` reads it from stdin. Passing an empty `--description` clears the description, and an empty `--depends-on` clears all dependencies. `--expected-version` is optional optimistic concurrency protection for scripts that first read a task.
+
+`--wake-at` and `--waiting-on` set a task's wait (see [Waiting](#waiting)). `--wake-at` takes `YYYY-MM-DD`, which means midnight UTC, or a full RFC 3339 timestamp; an empty value ends the wait and returns the task to the board.
 
 ```sh
 tasks edit --title "Research primary sources" <task-id>
@@ -85,6 +87,7 @@ The homepage is a three-column board of **To do**, **In progress**, and **Done**
 - **Delete task** at the bottom of the detail takes a card off the board without a confirmation prompt, because it is reversible: the toast that follows offers an undo, and the board's `n deleted` link opens `/deleted`, where every deleted task can be read and restored to exactly where it was.
 - Every drag has a pointer-free equivalent. The `⋯` menu on each card moves it between columns, and focusing a card and holding `⌘`/`Ctrl` with the arrow keys moves it left, right, up, or down.
 - Without JavaScript the same board renders, the `⋯` menu posts an ordinary form, and cards open a full detail page. File attachments live on that detail view, images previewed inline and everything else as a download.
+- A column shows only the cards you can act on. Anything waiting on someone else is folded behind a **`n` waiting** toggle beside the column count, and the count itself reports the actionable cards.
 
 Column order lives in `tasks.position`, a float that is halved between neighbors on each move so a drag writes one row. Tasks stored before the board could be reordered are spread out once, newest first, the first time the upgraded server opens the database.
 
@@ -93,6 +96,32 @@ tasks query 'SELECT id, status, blocked, title FROM task_overview ORDER BY creat
 tasks query "SELECT version, action, actor_kind, source, occurred_at, before_state, after_state FROM task_revisions WHERE task_id = '<task-id>' ORDER BY version"
 ```
 
+## Waiting
+
+A board that lists work you cannot start is a board you stop trusting. A task earns a place on it only when it has a next action nobody else has to take first; everything else is a commitment you are monitoring, and the only move it ever produces is *nudge* or *drop*.
+
+So every task carries a **wake condition**, and it is off the board until that condition is met:
+
+- **unfinished dependencies** — the board settles these itself, the moment the last prerequisite is done; and
+- **`wake_at`**, a date — for waits nothing in the database can settle, which is every wait on a person. A reply arrives in Slack, not here, so the board cannot detect it and does not pretend to; it just brings the task back when the date lands.
+
+`waiting_on` is the one line naming who or what you are waiting for, and it rides along with both. Set it. A wait with no name is one you will re-derive every time you see it.
+
+A card that comes back says why — **Woke Jul 27** or **Unblocked** — so work that returned on its own is not mistaken for work that was sitting there all along.
+
+`snooze_count` tallies how many times a wake date has been pushed out. At three the card and its detail panel say so, because a wait that has slipped three times is usually dead rather than early, and the honest next moves are to escalate, go ahead without them, or drop it.
+
+Two habits make the rest work. Give every wait a deadline and a default — "if the last reviewer has not replied by the 28th, ship with two of three" — so the wake-up is a five-second decision instead of a fresh one. And track other people's work as one waiting task of yours, not as one card per person: three cards for three reviewers is three re-reads of the same context for a single thread.
+
+Query what you have handed off:
+
+```sh
+tasks query "SELECT id, waiting_on, wake_at, snooze_count, title FROM task_overview WHERE sleeping = 1 ORDER BY wake_at"
+tasks query "SELECT id, snooze_count, waiting_on, title FROM task_overview WHERE snooze_count >= 3 ORDER BY snooze_count DESC"
+```
+
+`task_overview` exposes `blocked`, `snoozed`, and `sleeping` (either of the first two) alongside `wake_at`, `waiting_on`, and `snooze_count`.
+
 ## MCP
 
 The MCP endpoint is `https://your-host.example/mcp`. It implements Streamable HTTP plus OAuth authorization-code flow with S256 PKCE, dynamic client registration, authorization-server metadata, and protected-resource metadata. The authorization page asks the user for `TASKS_SECRET`.
@@ -100,16 +129,16 @@ The MCP endpoint is `https://your-host.example/mcp`. It implements Streamable HT
 Available tools:
 
 - `query_tasks_sql`: arbitrary read-only PostgreSQL `SELECT`, `WITH`, or `EXPLAIN` queries, capped at 500 rows, including task revision history;
-- `create_task`: create a todo, optionally with dependency IDs;
+- `create_task`: create a todo, optionally with dependency IDs and a `wake_at`/`waiting_on` wait;
 - `edit_task_text`: atomically apply one or more exact `old_text`/`new_text` replacements to a task title or description;
-- `update_task`: replace any supplied title, description, or complete dependency list;
+- `update_task`: replace any supplied title, description, complete dependency list, or wait (`wake_at` and `waiting_on`);
 - `complete_task`: mark a task done once its dependencies are done;
 - `delete_task`: soft-delete a task; and
 - `restore_task`: return a soft-deleted task to the board.
 
 `delete_task` never removes data. It stamps `tasks.deleted_at`, which takes the task off the board and out of `task_overview`, the domain list, and every other operation; `restore_task` clears the stamp and the task comes back with its status, board position, text, dependencies, and files intact. Two guardrails keep live dependencies resolvable: a task other live tasks depend on cannot be deleted, and a task whose own dependencies are still deleted cannot be restored until they are. Both tools are idempotent.
 
-`edit_task_text` is intended for agent-authored contextual edits. Replacements run in order in one transaction. By default each `old_text` must occur exactly once; missing or ambiguous text fails the whole call, while `replace_all: true` explicitly replaces every occurrence. `update_task` is the whole-field equivalent: omitted fields remain unchanged, while empty description text or an empty dependency list clears the field. Both tools accept an optional `expected_version` from a prior query so a stale agent cannot overwrite a newer task. Dependency edits reject missing tasks and cycles.
+`edit_task_text` is intended for agent-authored contextual edits. Replacements run in order in one transaction. By default each `old_text` must occur exactly once; missing or ambiguous text fails the whole call, while `replace_all: true` explicitly replaces every occurrence. `update_task` is the whole-field equivalent: omitted fields remain unchanged, while empty description text, an empty dependency list, an empty `wake_at`, or an empty `waiting_on` clears that field. Both tools accept an optional `expected_version` from a prior query so a stale agent cannot overwrite a newer task. Dependency edits reject missing tasks and cycles.
 
 There is deliberately no MCP `list_tasks` tool. Trusted agents can inspect the schema with:
 

@@ -42,9 +42,20 @@ type Task struct {
 	Position     float64      `json:"position" yaml:"position"`
 	Dependencies []string     `json:"dependencies,omitempty" yaml:"dependencies,omitempty"`
 	Attachments  []Attachment `json:"attachments,omitempty" yaml:"attachments,omitempty"`
-	CreatedAt    time.Time    `json:"created_at" yaml:"created_at"`
-	UpdatedAt    time.Time    `json:"updated_at" yaml:"updated_at"`
-	Version      int64        `json:"version" yaml:"version"`
+	// WakeAt holds a task back from the board until the date arrives. It is the
+	// half of a wake condition a clock can settle; unfinished dependencies are
+	// the other half, and callers combine both.
+	WakeAt *time.Time `json:"wake_at,omitempty" yaml:"wake_at,omitempty"`
+	// WaitingOn names who or what the task is waiting for, in one line. It is
+	// the reason a wake date exists and is shown wherever the task is.
+	WaitingOn string `json:"waiting_on,omitempty" yaml:"waiting_on,omitempty"`
+	// SnoozeCount counts how many times the wake date has been pushed out
+	// without the task being finished, so a thread nobody is going to answer
+	// stops looking like one that is merely early.
+	SnoozeCount int       `json:"snooze_count,omitempty" yaml:"snooze_count,omitempty"`
+	CreatedAt   time.Time `json:"created_at" yaml:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at" yaml:"updated_at"`
+	Version     int64     `json:"version" yaml:"version"`
 	// DeletedAt marks a soft-deleted task. The row and its whole revision
 	// history stay; the task simply leaves the board and every read until it is
 	// restored. Nil means the task is live.
@@ -54,6 +65,47 @@ type Task struct {
 // Deleted reports whether the task has been soft-deleted.
 func (t Task) Deleted() bool {
 	return t.DeletedAt != nil
+}
+
+// Snoozed reports whether the task's wake date is still in the future at now.
+// It answers only the clock half of the wake condition; a caller that also
+// knows the task's dependencies treats an unfinished one as asleep too.
+func (t Task) Snoozed(now time.Time) bool {
+	return t.WakeAt != nil && now.Before(*t.WakeAt)
+}
+
+// StaleWait reports whether the wait has been pushed out enough times that it
+// is more likely dead than early.
+func (t Task) StaleWait() bool {
+	return t.SnoozeCount >= staleSnoozeCount
+}
+
+// staleSnoozeCount is how many pushes turn a wait into a prompt to escalate,
+// proceed without the other party, or drop the thread.
+const staleSnoozeCount = 3
+
+// WakeAtLayouts are the wake-date spellings every interface accepts. A bare
+// date means midnight UTC, so a task set to wake on a day is back on the board
+// for all of it rather than partway through.
+var WakeAtLayouts = []string{time.RFC3339, "2006-01-02"}
+
+// ParseWakeAt turns a supplied wake date into an optional instant. An empty or
+// whitespace-only value means no date at all.
+func ParseWakeAt(value string) (*time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	for _, layout := range WakeAtLayouts {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			parsed = parsed.UTC()
+			return &parsed, nil
+		}
+	}
+	return nil, fmt.Errorf(
+		"%w: wake date %q must be YYYY-MM-DD or an RFC 3339 timestamp",
+		ErrInvalid, value,
+	)
 }
 
 // positionGap is the spacing a task claims when it lands at the top or bottom
@@ -72,6 +124,11 @@ type CreateInput struct {
 	Title        string   `json:"title"`
 	Description  string   `json:"description,omitempty"`
 	Dependencies []string `json:"dependencies,omitempty"`
+	// WakeAt starts the task asleep until the date arrives, for work that is
+	// captured already waiting on someone.
+	WakeAt *time.Time `json:"wake_at,omitempty"`
+	// WaitingOn names who or what the new task is waiting for.
+	WaitingOn string `json:"waiting_on,omitempty"`
 }
 
 type TextField string
@@ -94,9 +151,16 @@ type TextReplacement struct {
 // omitted field from a request to clear it. Replacements run in order after
 // any whole-field values have been applied.
 type EditInput struct {
-	Title           *string
-	Description     *string
-	Dependencies    *[]string
+	Title        *string
+	Description  *string
+	Dependencies *[]string
+	// WakeAt supplies a new wake date when non-nil. A zero time clears the
+	// date and returns the task to the board, mirroring how an empty
+	// description or dependency list clears those fields.
+	WakeAt *time.Time
+	// WaitingOn supplies a new one-line reason when non-nil; an empty string
+	// clears it.
+	WaitingOn       *string
 	Replacements    []TextReplacement
 	ExpectedVersion *int64
 }
@@ -163,9 +227,16 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Task, error) {
 		Status:       StatusTodo,
 		Position:     position,
 		Dependencies: dependencies,
+		WaitingOn:    strings.TrimSpace(input.WaitingOn),
 		CreatedAt:    now,
 		UpdatedAt:    now,
 		Version:      1,
+	}
+	if input.WakeAt != nil && !input.WakeAt.IsZero() {
+		wake := input.WakeAt.UTC()
+		created.WakeAt = &wake
+		// Capturing something already asleep is the first time it was set aside.
+		created.SnoozeCount = 1
 	}
 	if created.ID == "" {
 		return Task{}, fmt.Errorf("%w: generated ID is empty", ErrInvalid)
@@ -270,6 +341,8 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 	if input.Title == nil &&
 		input.Description == nil &&
 		input.Dependencies == nil &&
+		input.WakeAt == nil &&
+		input.WaitingOn == nil &&
 		len(input.Replacements) == 0 {
 		return Task{}, fmt.Errorf("%w: at least one edit is required", ErrInvalid)
 	}
@@ -298,6 +371,17 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 	if input.Dependencies != nil {
 		edited.Dependencies = uniqueNonEmpty(*input.Dependencies)
 	}
+	if input.WakeAt != nil {
+		if input.WakeAt.IsZero() {
+			edited.WakeAt = nil
+		} else {
+			wake := input.WakeAt.UTC()
+			edited.WakeAt = &wake
+		}
+	}
+	if input.WaitingOn != nil {
+		edited.WaitingOn = strings.TrimSpace(*input.WaitingOn)
+	}
 	for index, replacement := range input.Replacements {
 		if err := applyTextReplacement(&edited, replacement); err != nil {
 			return Task{}, fmt.Errorf("replacement %d: %w", index+1, err)
@@ -315,8 +399,19 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 	}
 	if edited.Title == current.Title &&
 		edited.Description == current.Description &&
-		slices.Equal(edited.Dependencies, current.Dependencies) {
+		slices.Equal(edited.Dependencies, current.Dependencies) &&
+		sameInstant(edited.WakeAt, current.WakeAt) &&
+		edited.WaitingOn == current.WaitingOn {
 		return clone(current), nil
+	}
+
+	switch {
+	case edited.WakeAt != nil && !sameInstant(edited.WakeAt, current.WakeAt):
+		// Every push to a new date is one more time this was set aside.
+		edited.SnoozeCount = current.SnoozeCount + 1
+	case edited.WakeAt == nil && current.WakeAt != nil:
+		// Clearing the date ends the wait, so the tally starts over.
+		edited.SnoozeCount = 0
 	}
 
 	edited.UpdatedAt = s.now().UTC()
@@ -629,12 +724,25 @@ func withAuditAction(ctx context.Context, action string) context.Context {
 	return WithAuditMetadata(ctx, metadata)
 }
 
+// sameInstant compares two optional wake dates, treating "no date" as equal to
+// itself so an edit that re-supplies the stored date stays a no-op.
+func sameInstant(first, second *time.Time) bool {
+	if first == nil || second == nil {
+		return first == nil && second == nil
+	}
+	return first.Equal(*second)
+}
+
 func clone(item Task) Task {
 	item.Dependencies = slices.Clone(item.Dependencies)
 	item.Attachments = slices.Clone(item.Attachments)
 	if item.DeletedAt != nil {
 		deletedAt := *item.DeletedAt
 		item.DeletedAt = &deletedAt
+	}
+	if item.WakeAt != nil {
+		wake := *item.WakeAt
+		item.WakeAt = &wake
 	}
 	return item
 }

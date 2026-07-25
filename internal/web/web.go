@@ -62,6 +62,10 @@ const (
 	sessionCookieMaxAge = 400 * 24 * time.Hour
 	maxAttachmentSize   = 50 << 20
 	excerptLimit        = 180
+	// fieldWakeAt and fieldWaitingOn name the two halves of a wait in the
+	// detail panel's edit form, alongside the title and description fields.
+	fieldWakeAt    = "wake_at"
+	fieldWaitingOn = "waiting_on"
 )
 
 //go:embed templates/*.html static/*.css static/*.js
@@ -118,23 +122,30 @@ type session struct {
 type sessionContextKey struct{}
 
 type pageData struct {
-	Error        string
-	CSRF         string
-	Columns      []boardColumn
-	DetailTask   taskCard
-	TaskCount    int
-	Deleted      []taskCard
-	DeletedCount int
-	Message      string
+	Error      string
+	CSRF       string
+	Columns    []boardColumn
+	DetailTask taskCard
+	TaskCount  int
+	// ActionableTasks counts the unfinished work that is nobody else's move,
+	// which is the only number the board is really trying to report.
+	ActionableTasks int
+	Deleted         []taskCard
+	DeletedCount    int
+	Message         string
 }
 
 // boardColumn is one kanban column: a workflow state plus the cards currently
-// parked in it, top card first.
+// parked in it, top card first. Sleeping cards stay in Tasks, in board order,
+// so a move still lands where the server expects; Awake and Waiting describe
+// how many of them are worth looking at now.
 type boardColumn struct {
-	Status Status
-	Label  string
-	Empty  string
-	Tasks  []taskCard
+	Status  Status
+	Label   string
+	Empty   string
+	Tasks   []taskCard
+	Awake   int
+	Waiting int
 }
 
 // Status is the workflow state a column or card belongs to. It mirrors
@@ -151,9 +162,20 @@ type taskCard struct {
 	Relative    string
 	Timestamp   string
 	Blocked     bool
-	DependsOn   []dependencyView
-	Cover       *task.Attachment
-	Moves       []moveOption
+	// Sleeping is the whole wake condition: the card is held back because it
+	// is blocked, snoozed, or both. It is what the board hides.
+	Sleeping bool
+	// Unblocked and Woke say why a card is back, so a task that returns on its
+	// own is not mistaken for one that was always sitting there.
+	Unblocked bool
+	Woke      bool
+	// WakeLabel is the wake date for people; WakeInput is the same date in the
+	// spelling a date field wants.
+	WakeLabel string
+	WakeInput string
+	DependsOn []dependencyView
+	Cover     *task.Attachment
+	Moves     []moveOption
 	// DeletedRelative and DeletedTimestamp describe when a soft-deleted task
 	// left the board, for the list of deleted tasks.
 	DeletedRelative  string
@@ -356,19 +378,30 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		{Status: task.StatusDone, Label: "Done", Empty: "Finished work lands here."},
 	}
 	position := map[Status]int{task.StatusTodo: 0, task.StatusInProgress: 1, task.StatusDone: 2}
+	actionable := 0
 	for _, item := range items {
 		index, ok := position[item.Status]
 		if !ok {
 			index = 0
 		}
-		columns[index].Tasks = append(columns[index].Tasks, h.newTaskCard(item, current.CSRF, lookup))
+		card := h.newTaskCard(item, current.CSRF, lookup)
+		if card.Sleeping {
+			columns[index].Waiting++
+		} else {
+			columns[index].Awake++
+			if card.Status != task.StatusDone {
+				actionable++
+			}
+		}
+		columns[index].Tasks = append(columns[index].Tasks, card)
 	}
 	h.render(w, http.StatusOK, "index.html", pageData{
-		CSRF:         current.CSRF,
-		Columns:      columns,
-		TaskCount:    len(items),
-		DeletedCount: len(deleted),
-		Message:      r.URL.Query().Get("message"),
+		CSRF:            current.CSRF,
+		Columns:         columns,
+		TaskCount:       len(items),
+		ActionableTasks: actionable,
+		DeletedCount:    len(deleted),
+		Message:         r.URL.Query().Get("message"),
 	})
 }
 
@@ -462,8 +495,27 @@ func (h *handler) editTask(w http.ResponseWriter, r *http.Request) {
 	case string(task.TextFieldDescription):
 		input.Description = &value
 		message = "Updated description"
+	case fieldWakeAt:
+		wake, err := h.wakeAtFromForm(r, value)
+		if err != nil {
+			h.mutationFailed(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		input.WakeAt = wake
+		if wake.IsZero() {
+			message = "Back on the board"
+		} else {
+			message = "Waiting until " + wake.Format("Jan 2")
+		}
+	case fieldWaitingOn:
+		trimmed := strings.TrimSpace(value)
+		input.WaitingOn = &trimmed
+		message = "Updated who this is waiting on"
+		if trimmed == "" {
+			message = "Cleared who this is waiting on"
+		}
 	default:
-		h.mutationFailed(w, r, http.StatusBadRequest, "field must be title or description")
+		h.mutationFailed(w, r, http.StatusBadRequest, "field must be title, description, wake_at, or waiting_on")
 		return
 	}
 
@@ -484,6 +536,30 @@ func (h *handler) editTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.writeEdit(w, r, edited, message)
+}
+
+// wakeAtFromForm reads the wake date the detail panel posted. The quick snooze
+// buttons send a number of days instead of a date so the browser never has to
+// agree with the server about what "in three days" means; an empty value from
+// either spelling clears the wait.
+func (h *handler) wakeAtFromForm(r *http.Request, value string) (*time.Time, error) {
+	if raw := strings.TrimSpace(r.PostForm.Get("days")); raw != "" {
+		days, err := strconv.Atoi(raw)
+		if err != nil || days < 0 {
+			return nil, errors.New("days must be a whole number of days from today")
+		}
+		wake := h.now().UTC().AddDate(0, 0, days)
+		return &wake, nil
+	}
+	wake, err := task.ParseWakeAt(value)
+	if err != nil {
+		return nil, err
+	}
+	if wake == nil {
+		// task.EditInput spells "no wake date" as the zero time.
+		return new(time.Time), nil
+	}
+	return wake, nil
 }
 
 func (h *handler) writeEdit(w http.ResponseWriter, r *http.Request, item task.Task, message string) {
@@ -688,6 +764,16 @@ func (h *handler) newTaskCard(item task.Task, csrf string, lookup func(string) (
 			card.Blocked = true
 		}
 		card.DependsOn = append(card.DependsOn, view)
+	}
+	now := h.now()
+	// Finished work is not waiting on anything, whatever it was waiting on
+	// before it was finished.
+	card.Sleeping = item.Status != task.StatusDone && (card.Blocked || item.Snoozed(now))
+	card.Unblocked = len(item.Dependencies) > 0 && !card.Blocked
+	if item.WakeAt != nil {
+		card.WakeLabel = item.WakeAt.Format("Jan 2")
+		card.WakeInput = item.WakeAt.Format("2006-01-02")
+		card.Woke = !item.Snoozed(now)
 	}
 	for index, attachment := range item.Attachments {
 		if isImage(attachment.ContentType) {

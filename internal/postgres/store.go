@@ -51,6 +51,11 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS position DOUBLE PRECISION NOT NULL DE
 -- Soft delete: a deleted task keeps its row and its whole revision history, and
 -- a NULL deleted_at marks a task that is still on the board.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+-- A wake condition holds a task off the board until a date arrives. Tasks
+-- stored before waits existed have no date and are awake, which is the default.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS wake_at TIMESTAMPTZ;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS waiting_on TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS snooze_count INTEGER NOT NULL DEFAULT 0;
 -- Tasks stored before the board could be reordered by hand all share position
 -- zero. Spread them out once, keeping the newest-first order they were shown in.
 DO $$
@@ -109,6 +114,7 @@ CREATE TABLE IF NOT EXISTS task_revisions (
 );
 CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status);
 CREATE INDEX IF NOT EXISTS tasks_deleted_at_idx ON tasks(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS tasks_wake_at_idx ON tasks(wake_at) WHERE wake_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS dependencies_depends_on_idx ON dependencies(depends_on_id);
 CREATE INDEX IF NOT EXISTS task_revisions_occurred_at_idx ON task_revisions(occurred_at, revision_id);
 CREATE OR REPLACE FUNCTION reject_task_revision_mutation()
@@ -124,7 +130,10 @@ CREATE TRIGGER task_revisions_immutable
 	BEFORE UPDATE OR DELETE OR TRUNCATE ON task_revisions
 	FOR EACH STATEMENT
 	EXECUTE FUNCTION reject_task_revision_mutation();
-CREATE OR REPLACE VIEW task_overview AS
+-- CREATE OR REPLACE VIEW can only append columns, and the wait columns land in
+-- the middle, so replace the view outright. Nothing depends on it.
+DROP VIEW IF EXISTS task_overview;
+CREATE VIEW task_overview AS
 SELECT
 	t.id,
 	t.title,
@@ -138,6 +147,18 @@ SELECT
 		JOIN tasks prerequisite ON prerequisite.id = d.depends_on_id
 		WHERE d.task_id = t.id AND prerequisite.status <> 'done'
 	) THEN 1 ELSE 0 END AS blocked,
+	CASE WHEN t.wake_at IS NOT NULL AND t.wake_at > now() THEN 1 ELSE 0 END AS snoozed,
+	-- sleeping is the whole wake condition: a task is off the board while it
+	-- waits on an unfinished dependency or on a date that has not arrived.
+	CASE WHEN EXISTS (
+		SELECT 1
+		FROM dependencies d
+		JOIN tasks prerequisite ON prerequisite.id = d.depends_on_id
+		WHERE d.task_id = t.id AND prerequisite.status <> 'done'
+	) OR (t.wake_at IS NOT NULL AND t.wake_at > now()) THEN 1 ELSE 0 END AS sleeping,
+	t.wake_at,
+	t.waiting_on,
+	t.snooze_count,
 	(SELECT count(*) FROM dependencies d WHERE d.task_id = t.id) AS dependency_count,
 	(SELECT count(*) FROM images i WHERE i.task_id = t.id) AS image_count,
 	t.version,
@@ -223,7 +244,7 @@ func (s *Store) SetMaxRows(maximum int) {
 
 // taskColumns is the stored task projection every read shares, in the order
 // scanTask expects.
-const taskColumns = `id, title, description, status, position, created_at, updated_at, version, deleted_at`
+const taskColumns = `id, title, description, status, position, wake_at, waiting_on, snooze_count, created_at, updated_at, version, deleted_at`
 
 // Create inserts a new task and its dependencies and images atomically.
 func (s *Store) Create(ctx context.Context, item task.Task) error {
@@ -235,9 +256,14 @@ func (s *Store) Create(ctx context.Context, item task.Task) error {
 	}
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO tasks (id, title, description, status, position, created_at, updated_at, version, deleted_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		`, item.ID, item.Title, item.Description, string(item.Status), item.Position, item.CreatedAt, item.UpdatedAt, item.Version, item.DeletedAt)
+			INSERT INTO tasks (
+				id, title, description, status, position, wake_at, waiting_on, snooze_count,
+				created_at, updated_at, version, deleted_at
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		`, item.ID, item.Title, item.Description, string(item.Status), item.Position,
+			item.WakeAt, item.WaitingOn, item.SnoozeCount,
+			item.CreatedAt, item.UpdatedAt, item.Version, item.DeletedAt)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return task.ErrAlreadyExists
@@ -265,9 +291,13 @@ func (s *Store) Update(ctx context.Context, item task.Task) error {
 		}
 		tag, err := tx.Exec(ctx, `
 			UPDATE tasks
-			SET title = $2, description = $3, status = $4, position = $5, updated_at = $6, version = $7, deleted_at = $8
-			WHERE id = $1 AND version = $9
-		`, item.ID, item.Title, item.Description, string(item.Status), item.Position, item.UpdatedAt, item.Version, item.DeletedAt, before.Version)
+			SET title = $2, description = $3, status = $4, position = $5,
+				wake_at = $6, waiting_on = $7, snooze_count = $8,
+				updated_at = $9, version = $10, deleted_at = $11
+			WHERE id = $1 AND version = $12
+		`, item.ID, item.Title, item.Description, string(item.Status), item.Position,
+			item.WakeAt, item.WaitingOn, item.SnoozeCount,
+			item.UpdatedAt, item.Version, item.DeletedAt, before.Version)
 		if err != nil {
 			return err
 		}
@@ -608,6 +638,7 @@ func scanTask(row pgx.Row) (task.Task, error) {
 	var status string
 	err := row.Scan(
 		&item.ID, &item.Title, &item.Description, &status, &item.Position,
+		&item.WakeAt, &item.WaitingOn, &item.SnoozeCount,
 		&item.CreatedAt, &item.UpdatedAt, &item.Version, &item.DeletedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -622,6 +653,10 @@ func scanTask(row pgx.Row) (task.Task, error) {
 	if item.DeletedAt != nil {
 		deletedAt := item.DeletedAt.UTC()
 		item.DeletedAt = &deletedAt
+	}
+	if item.WakeAt != nil {
+		wakeAt := item.WakeAt.UTC()
+		item.WakeAt = &wakeAt
 	}
 	return item, nil
 }

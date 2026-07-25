@@ -343,3 +343,99 @@ func TestHandlerRejectsUnknownTool(t *testing.T) {
 		t.Fatalf("error code = %q", envelope.Error.Code)
 	}
 }
+
+func TestUpdateTaskSetsAndClearsTheWait(t *testing.T) {
+	t.Parallel()
+
+	repo := tasktest.NewRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := task.NewService(repo, func() time.Time { return now }, func() string { return "licence-signoff" })
+	tools := NewTools(service, readerFunc(func(context.Context, string) (postgres.Result, error) {
+		return postgres.Result{}, nil
+	}))
+	created, err := tools.CreateTask(context.Background(), CreateTaskInput{Title: "Priya, Tom & Rae sign off"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	for _, supplied := range []struct {
+		name string
+		raw  string
+		want time.Time
+	}{
+		{name: "date only", raw: "2026-07-27", want: time.Date(2026, time.July, 27, 0, 0, 0, 0, time.UTC)},
+		{name: "timestamp", raw: "2026-07-28T13:30:00Z", want: time.Date(2026, time.July, 28, 13, 30, 0, 0, time.UTC)},
+		{name: "offset timestamp", raw: "2026-07-29T09:00:00-04:00", want: time.Date(2026, time.July, 29, 13, 0, 0, 0, time.UTC)},
+	} {
+		waitingOn := "Priya, Tom & Rae"
+		edited, err := tools.UpdateTask(context.Background(), UpdateTaskInput{
+			ID: created.ID, WakeAt: &supplied.raw, WaitingOn: &waitingOn,
+		})
+		if err != nil {
+			t.Fatalf("UpdateTask with a %s wake date: %v", supplied.name, err)
+		}
+		if edited.WakeAt == nil || !edited.WakeAt.Equal(supplied.want) {
+			t.Fatalf("%s wake date = %v, want %v", supplied.name, edited.WakeAt, supplied.want)
+		}
+		if edited.WaitingOn != waitingOn {
+			t.Fatalf("%s waiting on = %q", supplied.name, edited.WaitingOn)
+		}
+	}
+
+	empty := ""
+	awake, err := tools.UpdateTask(context.Background(), UpdateTaskInput{
+		ID: created.ID, WakeAt: &empty, WaitingOn: &empty,
+	})
+	if err != nil {
+		t.Fatalf("UpdateTask clearing the wait: %v", err)
+	}
+	if awake.WakeAt != nil || awake.WaitingOn != "" {
+		t.Fatalf("clearing the wait left %#v", awake)
+	}
+}
+
+func TestUpdateTaskRejectsAnUnparsableWakeDate(t *testing.T) {
+	t.Parallel()
+
+	repo := tasktest.NewRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := task.NewService(repo, func() time.Time { return now }, func() string { return "bad-date" })
+	tools := NewTools(service, readerFunc(func(context.Context, string) (postgres.Result, error) {
+		return postgres.Result{}, nil
+	}))
+	created, err := tools.CreateTask(context.Background(), CreateTaskInput{Title: "Bad date"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	raw := "next tuesday"
+	if _, err := tools.UpdateTask(context.Background(), UpdateTaskInput{ID: created.ID, WakeAt: &raw}); !errors.Is(err, task.ErrInvalid) {
+		t.Fatalf("UpdateTask error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestCreateTaskAcceptsAWait(t *testing.T) {
+	t.Parallel()
+
+	repo := tasktest.NewRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := task.NewService(repo, func() time.Time { return now }, func() string { return "waiting-from-birth" })
+	tools := NewTools(service, readerFunc(func(context.Context, string) (postgres.Result, error) {
+		return postgres.Result{}, nil
+	}))
+	created, err := tools.CreateTask(context.Background(), CreateTaskInput{
+		Title: "Chase the signed contract", WakeAt: "2026-08-03", WaitingOn: "the vendor",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	want := time.Date(2026, time.August, 3, 0, 0, 0, 0, time.UTC)
+	if created.WakeAt == nil || !created.WakeAt.Equal(want) {
+		t.Fatalf("wake date = %v, want %v", created.WakeAt, want)
+	}
+	if created.WaitingOn != "the vendor" || created.SnoozeCount != 1 {
+		t.Fatalf("created wait = %q, snoozes = %d", created.WaitingOn, created.SnoozeCount)
+	}
+	if !created.Snoozed(now) {
+		t.Fatal("a task created with a future wake date should start asleep")
+	}
+}
