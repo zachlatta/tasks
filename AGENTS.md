@@ -38,5 +38,5 @@ never paste their contents into this public repository, commits, or issues.
 - When working in a worktree, the default finish flow is to commit completed work and push it to `main`.
 - Before asking for permission to commit and push, finish the implementation, run the full automated test suite end to end, and manually test the changes.
 - Always show the verification results and ask the user for explicit confirmation before committing or pushing.
-- Ask for that confirmation with an interactive prompt when the harness supports one (for example Claude Code's `AskUserQuestion` tool), offering at least a "commit and push to `main`" option and a "don't commit" option. Fall back to a plain question in chat when no interactive prompt is available.
+- Ask for that confirmation with an interactive prompt when the harness supports one (for example Claude Code's `AskUserQuestion` tool). Offer three options: "commit and push to `main`", "continue work", and "commit only and continue work". Fall back to a plain question in chat when no interactive prompt is available.
 - Never commit or push unfinished or failing work unless the user explicitly requests it.
