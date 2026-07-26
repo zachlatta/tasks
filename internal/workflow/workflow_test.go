@@ -7,33 +7,38 @@ import (
 	"testing"
 )
 
-func TestTrustedReleaseWorkflowsUseRotomBuilder(t *testing.T) {
+func TestEveryTrustedJobUsesDistinctRotomRunner(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"edge-release.yml", "release.yml"} {
-		name := name
+	for name, runner := range map[string]string{
+		"edge-release.yml": "runs-on: rotom-builder-tasks-edge-release",
+		"release.yml":      "runs-on: rotom-builder-tasks-stable-release",
+	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			workflow := readWorkflow(t, name)
-			if !strings.Contains(
-				workflow,
-				"runs-on: [self-hosted, linux, x64, rotom-builder]",
-			) {
-				t.Fatalf("%s must use the isolated Rotom builder", name)
+			if !strings.Contains(workflow, runner) {
+				t.Fatalf("%s must use its distinct Rotom runner", name)
 			}
 		})
 	}
+
+	ci := readWorkflow(t, "ci.yml")
+	trustedCIRunner := `runs-on: >-
+      ${{ github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name != github.repository &&
+          'ubuntu-latest' || 'rotom-builder-tasks-ci' }}`
+	if !strings.Contains(ci, trustedCIRunner) {
+		t.Fatal("trusted CI must use its distinct Rotom runner")
+	}
 }
 
-func TestPullRequestCIRemainsGitHubHosted(t *testing.T) {
+func TestForkPullRequestCIRemainsGitHubHosted(t *testing.T) {
 	t.Parallel()
 
 	workflow := readWorkflow(t, "ci.yml")
-	if !strings.Contains(workflow, "runs-on: ubuntu-latest") {
+	if !strings.Contains(workflow, "'ubuntu-latest' ||") {
 		t.Fatal("public pull-request CI must remain GitHub-hosted")
-	}
-	if strings.Contains(workflow, "rotom-builder") {
-		t.Fatal("public pull-request CI must never target the Rotom builder")
 	}
 }
 

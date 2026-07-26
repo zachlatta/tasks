@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: [self-hosted, linux, x64, rotom-builder]
+    runs-on: rotom-builder-tasks-stable-release
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
