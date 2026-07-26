@@ -15,6 +15,7 @@
         <input type="hidden" name="csrf" value="{{.CSRF}}">
         <label for="task-title">Title<input id="task-title" name="title" autocomplete="off" required></label>
         <label for="task-dependencies">Depends on <span>comma-separated IDs</span><input id="task-dependencies" name="dependencies" autocomplete="off"></label>
+        <label for="task-context">Context <span>optional</span><input id="task-context" name="context" autocomplete="off" placeholder="home, office, online"></label>
         <label class="composer-description" for="task-description">Description <span>Markdown</span><textarea id="task-description" name="description" rows="2"></textarea></label>
         <button type="submit">Add to board</button>
       </form>
@@ -25,8 +26,16 @@
         <p class="eyebrow">WORKFLOW</p>
         <h2 id="board-heading">The board</h2>
       </div>
-      <p class="board-hint">Showing the {{.ActionableTasks}} task{{if ne .ActionableTasks 1}}s{{end}} nobody else has to move first. Anything waiting on a person or a prerequisite is one click away, per column.</p>
+      <p class="board-hint">Showing the <span id="board-actionable">{{.ActionableTasks}}</span> <span id="board-task-word">task{{if ne .ActionableTasks 1}}s{{end}}</span> you can act on in this context. Anything waiting on a person or prerequisite is one click away, per column.</p>
       {{if .DeletedCount}}<p class="board-deleted"><a href="/deleted">{{.DeletedCount}} deleted</a></p>{{end}}
+      <label class="board-context" for="board-context">
+        <span>Context</span>
+        <select id="board-context">
+          <option value="" selected>Anywhere</option>
+          <option value="*">All contexts</option>
+          {{range .Contexts}}<option value="{{.}}">@{{.}}</option>{{end}}
+        </select>
+      </label>
       <label class="board-filter" for="board-filter">
         <span class="visually-hidden">Filter cards</span>
         <input id="board-filter" type="search" placeholder="Filter {{.TaskCount}} tasks" autocomplete="off">

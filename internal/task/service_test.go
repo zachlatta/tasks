@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -781,7 +782,10 @@ func TestEditSetsAndClearsTheWait(t *testing.T) {
 
 	wake := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
 	waitingOn := "Priya, Tom & Rae (asked Mar 4)"
-	slept, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &wake, WaitingOn: &waitingOn})
+	onTimeout := "Send one final reminder, then proceed without approval"
+	slept, err := service.Edit(context.Background(), created.ID, EditInput{
+		WakeAt: &wake, WaitingOn: &waitingOn, OnTimeout: &onTimeout,
+	})
 	if err != nil {
 		t.Fatalf("Edit to sleep: %v", err)
 	}
@@ -791,6 +795,9 @@ func TestEditSetsAndClearsTheWait(t *testing.T) {
 	if slept.WaitingOn != waitingOn {
 		t.Fatalf("waiting on = %q, want %q", slept.WaitingOn, waitingOn)
 	}
+	if slept.OnTimeout != onTimeout {
+		t.Fatalf("on timeout = %q, want %q", slept.OnTimeout, onTimeout)
+	}
 	if !slept.Snoozed(now) {
 		t.Fatal("task should be snoozed right after it is put to sleep")
 	}
@@ -799,7 +806,9 @@ func TestEditSetsAndClearsTheWait(t *testing.T) {
 	}
 
 	// Re-supplying the same wait changes nothing and must not count as a snooze.
-	same, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &wake, WaitingOn: &waitingOn})
+	same, err := service.Edit(context.Background(), created.ID, EditInput{
+		WakeAt: &wake, WaitingOn: &waitingOn, OnTimeout: &onTimeout,
+	})
 	if err != nil {
 		t.Fatalf("Edit with an unchanged wait: %v", err)
 	}
@@ -809,11 +818,13 @@ func TestEditSetsAndClearsTheWait(t *testing.T) {
 
 	var cleared time.Time
 	empty := ""
-	awake, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &cleared, WaitingOn: &empty})
+	awake, err := service.Edit(context.Background(), created.ID, EditInput{
+		WakeAt: &cleared, WaitingOn: &empty, OnTimeout: &empty,
+	})
 	if err != nil {
 		t.Fatalf("Edit to wake: %v", err)
 	}
-	if awake.WakeAt != nil || awake.WaitingOn != "" {
+	if awake.WakeAt != nil || awake.WaitingOn != "" || awake.OnTimeout != "" {
 		t.Fatalf("clearing the wait left %#v", awake)
 	}
 	if awake.Snoozed(now) {
@@ -857,12 +868,118 @@ func TestEditTrimsWaitingOn(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	padded := "  Priya Raman  "
-	edited, err := service.Edit(context.Background(), created.ID, EditInput{WaitingOn: &padded})
+	wake := now.AddDate(0, 0, 3)
+	edited, err := service.Edit(context.Background(), created.ID, EditInput{WakeAt: &wake, WaitingOn: &padded})
 	if err != nil {
 		t.Fatalf("Edit: %v", err)
 	}
 	if edited.WaitingOn != "Priya Raman" {
 		t.Fatalf("waiting on = %q, want trimmed", edited.WaitingOn)
+	}
+}
+
+func TestWaitOnSomeoneRequiresAReviewDateOrDependency(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	ids := []string{"reviewer", "follow-up"}
+	service := NewService(repo, func() time.Time { return now }, func() string {
+		id := ids[0]
+		ids = ids[1:]
+		return id
+	})
+	reviewer, err := service.Create(context.Background(), CreateInput{Title: "Review the draft"})
+	if err != nil {
+		t.Fatalf("Create reviewer: %v", err)
+	}
+
+	waitingOn := "the reviewer"
+	if _, err := service.Create(context.Background(), CreateInput{
+		Title: "Follow up", WaitingOn: waitingOn,
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Create error = %v, want ErrInvalid", err)
+	}
+
+	followUp, err := service.Create(context.Background(), CreateInput{
+		Title: "Follow up", Dependencies: []string{reviewer.ID}, WaitingOn: waitingOn,
+	})
+	if err != nil {
+		t.Fatalf("Create dependency-backed wait: %v", err)
+	}
+	if followUp.WaitingOn != waitingOn {
+		t.Fatalf("waiting on = %q", followUp.WaitingOn)
+	}
+
+	emptyDependencies := []string{}
+	if _, err := service.Edit(context.Background(), followUp.ID, EditInput{
+		Dependencies: &emptyDependencies,
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("removing the only review trigger error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestTaskContextIsNormalizedAndCheckedIndependently(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, func() time.Time { return now }, func() string { return "home-task" })
+	checkedInOffset := time.Date(2026, time.July, 23, 9, 30, 0, 0, time.FixedZone("UTC-4", -4*60*60))
+	created, err := service.Create(context.Background(), CreateInput{
+		Title:            "Replace the filter",
+		Context:          "  @Home  ",
+		ContextCheckedAt: &checkedInOffset,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.Context != "home" {
+		t.Fatalf("context = %q, want home", created.Context)
+	}
+	if created.ContextCheckedAt == nil ||
+		created.ContextCheckedAt.Location() != time.UTC ||
+		!created.ContextCheckedAt.Equal(checkedInOffset) {
+		t.Fatalf("context checked at = %v, want %v in UTC", created.ContextCheckedAt, checkedInOffset)
+	}
+
+	title := "Replace the air filter"
+	edited, err := service.Edit(context.Background(), created.ID, EditInput{Title: &title})
+	if err != nil {
+		t.Fatalf("Edit title: %v", err)
+	}
+	if edited.ContextCheckedAt == nil || !edited.ContextCheckedAt.Equal(checkedInOffset) {
+		t.Fatalf("an unrelated edit changed context checked at to %v", edited.ContextCheckedAt)
+	}
+
+	emptyContext := ""
+	var cleared time.Time
+	edited, err = service.Edit(context.Background(), created.ID, EditInput{
+		Context: &emptyContext, ContextCheckedAt: &cleared,
+	})
+	if err != nil {
+		t.Fatalf("clear context metadata: %v", err)
+	}
+	if edited.Context != "" || edited.ContextCheckedAt != nil {
+		t.Fatalf("clearing context metadata left %#v", edited)
+	}
+}
+
+func TestTaskContextRejectsMultilineOrOverlongValues(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(newMemoryRepository(), time.Now, func() string { return "invalid-context" })
+	for name, contextName := range map[string]string{
+		"multiline": "home\nshop",
+		"overlong":  strings.Repeat("x", 65),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := service.Create(context.Background(), CreateInput{
+				Title: "Scoped task", Context: contextName,
+			}); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("Create error = %v, want ErrInvalid", err)
+			}
+		})
 	}
 }
 

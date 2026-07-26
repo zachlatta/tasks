@@ -1433,21 +1433,14 @@ func TestDetailEditsTheWait(t *testing.T) {
 
 	sleep := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
 		"csrf":             {csrf},
-		"field":            {"wake_at"},
-		"value":            {"2099-07-27"},
+		"field":            {"wait"},
+		"wake_at":          {"2099-07-27"},
+		"waiting_on":       {"the reviewers"},
+		"on_timeout":       {"Proceed with the reviewers who replied"},
 		"expected_version": {"1"},
 	}, cookie)
 	if sleep.Code != http.StatusSeeOther {
-		t.Fatalf("wake_at edit status = %d; body: %s", sleep.Code, sleep.Body.String())
-	}
-	wait := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
-		"csrf":             {csrf},
-		"field":            {"waiting_on"},
-		"value":            {"Priya, Tom & Rae"},
-		"expected_version": {"2"},
-	}, cookie)
-	if wait.Code != http.StatusSeeOther {
-		t.Fatalf("waiting_on edit status = %d; body: %s", wait.Code, wait.Body.String())
+		t.Fatalf("wait edit status = %d; body: %s", sleep.Code, sleep.Body.String())
 	}
 
 	stored, err := service.Get(context.Background(), created.ID)
@@ -1458,8 +1451,11 @@ func TestDetailEditsTheWait(t *testing.T) {
 	if stored.WakeAt == nil || !stored.WakeAt.Equal(want) {
 		t.Fatalf("wake date = %v, want %v", stored.WakeAt, want)
 	}
-	if stored.WaitingOn != "Priya, Tom & Rae" {
+	if stored.WaitingOn != "the reviewers" {
 		t.Fatalf("waiting on = %q", stored.WaitingOn)
+	}
+	if stored.OnTimeout != "Proceed with the reviewers who replied" {
+		t.Fatalf("on timeout = %q", stored.OnTimeout)
 	}
 
 	detail := get(t, handler, "/"+created.ID, cookie)
@@ -1467,21 +1463,29 @@ func TestDetailEditsTheWait(t *testing.T) {
 	if !strings.Contains(body, `class="wait-editor`) {
 		t.Fatalf("detail page is missing the wait editor; body: %s", body)
 	}
-	for _, field := range []string{`value="wake_at"`, `value="waiting_on"`} {
-		if !strings.Contains(body, field) {
-			t.Fatalf("wait editor cannot edit %s; body: %s", field, body)
+	if strings.Count(body, `name="field" value="wait"`) != 2 {
+		t.Fatalf("wait editor and clear action should each post the atomic wait operation; body: %s", body)
+	}
+	for _, legacy := range []string{`value="wake_at"`, `value="waiting_on"`} {
+		if strings.Contains(body, legacy) {
+			t.Fatalf("wait editor still posts the partial field %s; body: %s", legacy, body)
 		}
 	}
-	if !strings.Contains(body, "Priya, Tom &amp; Rae") {
+	if !strings.Contains(body, "the reviewers") {
 		t.Fatalf("detail page should show who the task waits on; body: %s", body)
 	}
+	if !strings.Contains(body, "Proceed with the reviewers who replied") {
+		t.Fatalf("detail page should show the fallback action; body: %s", body)
+	}
 
-	// Clearing the date returns the task to the board.
+	// Ending a wait clears the complete wait atomically.
 	clear := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
 		"csrf":             {csrf},
-		"field":            {"wake_at"},
-		"value":            {""},
-		"expected_version": {"3"},
+		"field":            {"wait"},
+		"wake_at":          {""},
+		"waiting_on":       {""},
+		"on_timeout":       {""},
+		"expected_version": {"2"},
 	}, cookie)
 	if clear.Code != http.StatusSeeOther {
 		t.Fatalf("clearing status = %d; body: %s", clear.Code, clear.Body.String())
@@ -1490,8 +1494,8 @@ func TestDetailEditsTheWait(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get after clearing: %v", err)
 	}
-	if awake.WakeAt != nil {
-		t.Fatalf("wake date = %v, want cleared", awake.WakeAt)
+	if awake.WakeAt != nil || awake.WaitingOn != "" || awake.OnTimeout != "" {
+		t.Fatalf("clearing the wait left %#v", awake)
 	}
 }
 
@@ -1506,8 +1510,9 @@ func TestDetailRejectsAnUnparsableWakeDate(t *testing.T) {
 	cookie, csrf := login(t, handler)
 	response := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
 		"csrf":             {csrf},
-		"field":            {"wake_at"},
-		"value":            {"next tuesday"},
+		"field":            {"wait"},
+		"wake_at":          {"next tuesday"},
+		"waiting_on":       {"the reviewer"},
 		"expected_version": {"1"},
 	}, cookie)
 	if response.Code != http.StatusBadRequest {
@@ -1527,7 +1532,9 @@ func TestSnoozeButtonsSetAWakeDate(t *testing.T) {
 	before := time.Now().UTC()
 	response := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
 		"csrf":             {csrf},
-		"field":            {"wake_at"},
+		"field":            {"wait"},
+		"waiting_on":       {"the reviewer"},
+		"on_timeout":       {"Proceed without a reply"},
 		"days":             {"3"},
 		"expected_version": {"1"},
 	}, cookie)
@@ -1544,6 +1551,140 @@ func TestSnoozeButtonsSetAWakeDate(t *testing.T) {
 	earliest, latest := before.AddDate(0, 0, 3), time.Now().UTC().AddDate(0, 0, 3).Add(time.Minute)
 	if stored.WakeAt.Before(earliest) || stored.WakeAt.After(latest) {
 		t.Fatalf("wake date = %v, want roughly 3 days out", stored.WakeAt)
+	}
+	if stored.WaitingOn != "the reviewer" || stored.OnTimeout != "Proceed without a reply" {
+		t.Fatalf("relative wait lost its atomic fields: %#v", stored)
+	}
+}
+
+func TestDetailRejectsANamedWaitWithoutAReviewDate(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandler(t)
+	created, err := service.Create(context.Background(), task.CreateInput{Title: "Wait safely"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+	response := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
+		"csrf":             {csrf},
+		"field":            {"wait"},
+		"waiting_on":       {"the reviewer"},
+		"on_timeout":       {"Proceed without a reply"},
+		"expected_version": {"1"},
+	}, cookie)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+}
+
+func TestBoardAndDetailExposeExecutionContext(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "anywhere", "home", "shop")
+	for _, input := range []task.CreateInput{
+		{Title: "Write a note"},
+		{Title: "Replace a filter", Context: "@Home"},
+		{Title: "Pick up supplies", Context: "shop"},
+	} {
+		if _, err := service.Create(context.Background(), input); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+	cookie, csrf := login(t, handler)
+	body := get(t, handler, "/", cookie).Body.String()
+	for _, want := range []string{
+		`id="board-context"`,
+		`value="" selected>Anywhere`,
+		`value="home">@home`,
+		`value="shop">@shop`,
+		`data-context="home"`,
+		`data-context="shop"`,
+		`class="chip chip-context">@home`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("board is missing context UI %q; body: %s", want, body)
+		}
+	}
+
+	response := postForm(handler, "/tasks/home/edit", url.Values{
+		"csrf":             {csrf},
+		"field":            {"context"},
+		"value":            {" @GARAGE "},
+		"expected_version": {"1"},
+	}, cookie)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("context edit status = %d; body: %s", response.Code, response.Body.String())
+	}
+	edited, err := service.Get(context.Background(), "home")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if edited.Context != "garage" {
+		t.Fatalf("context = %q, want garage", edited.Context)
+	}
+}
+
+func TestDetailShowsExactLocalizableTimesAndTracksContextChecksSeparately(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 25, 15, 45, 0, 0, time.UTC)
+	root := t.TempDir()
+	repo := tasktest.NewRepository()
+	service := task.NewService(repo, func() time.Time { return now }, func() string { return "checked-task" })
+	handler := New(Config{
+		Tasks:   service,
+		Reader:  repo,
+		Objects: objectstore.NewLocal(filepath.Join(root, "objects")),
+		Auth:    auth.NewServer(auth.Config{Issuer: "http://tasks.example.com", Secret: "shared-secret"}),
+		Now:     func() time.Time { return now },
+	})
+	created, err := service.Create(context.Background(), task.CreateInput{
+		Title: "Confirm the current instructions", Context: "online",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	cookie, csrf := login(t, handler)
+
+	response := postForm(handler, "/tasks/"+created.ID+"/edit", url.Values{
+		"csrf":             {csrf},
+		"field":            {"context_checked_at"},
+		"value":            {"now"},
+		"expected_version": {"1"},
+	}, cookie)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("context check edit status = %d; body: %s", response.Code, response.Body.String())
+	}
+	checked, err := service.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if checked.ContextCheckedAt == nil || !checked.ContextCheckedAt.Equal(now) {
+		t.Fatalf("context checked at = %v, want %v", checked.ContextCheckedAt, now)
+	}
+
+	body := get(t, handler, "/"+created.ID, cookie).Body.String()
+	if strings.Count(body, `data-local-time`) < 2 {
+		t.Fatalf("detail should expose updated and context-checked timestamps for browser-local rendering; body: %s", body)
+	}
+	for _, want := range []string{
+		`datetime="2026-07-25T15:45:00Z"`,
+		`Context checked`,
+		`Mark checked now`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("detail is missing timestamp UI %q; body: %s", want, body)
+		}
+	}
+
+	title := "Confirm the latest instructions"
+	updated, err := service.Edit(context.Background(), created.ID, task.EditInput{Title: &title})
+	if err != nil {
+		t.Fatalf("edit title: %v", err)
+	}
+	if updated.ContextCheckedAt == nil || !updated.ContextCheckedAt.Equal(now) {
+		t.Fatalf("ordinary edit changed context checked at to %v", updated.ContextCheckedAt)
 	}
 }
 

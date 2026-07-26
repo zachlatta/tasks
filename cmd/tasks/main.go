@@ -86,16 +86,22 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		dependencies := flags.String("depends-on", "", "comma-separated dependency task IDs")
 		wakeAt := flags.String("wake-at", "", "hold the task off the board until this date (YYYY-MM-DD or RFC 3339)")
 		waitingOn := flags.String("waiting-on", "", "one line naming who or what the task is waiting for")
+		onTimeout := flags.String("on-timeout", "", "default action if the wait is unresolved at the review date")
+		contextName := flags.String("context", "", "execution-context tag such as home, office, or online")
+		contextCheckedAt := flags.String("context-checked-at", "", "when supporting context was last verified (RFC 3339)")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}
 		title := strings.Join(flags.Args(), " ")
 		created, err := client.CreateTask(context.Background(), taskapi.CreateTaskInput{
-			Title:        title,
-			Description:  *description,
-			Dependencies: strings.Split(*dependencies, ","),
-			WakeAt:       *wakeAt,
-			WaitingOn:    *waitingOn,
+			Title:            title,
+			Description:      *description,
+			Dependencies:     strings.Split(*dependencies, ","),
+			WakeAt:           *wakeAt,
+			WaitingOn:        *waitingOn,
+			OnTimeout:        *onTimeout,
+			Context:          *contextName,
+			ContextCheckedAt: *contextCheckedAt,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "add task: %v\n", err)
@@ -112,6 +118,9 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		var dependencies optionalString
 		var wakeAt optionalString
 		var waitingOn optionalString
+		var onTimeout optionalString
+		var contextName optionalString
+		var contextCheckedAt optionalString
 		var expectedVersion optionalPositiveInt64
 		flags.Var(&title, "title", "complete replacement title")
 		flags.Var(&description, "description", "complete replacement Markdown description")
@@ -119,20 +128,31 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		flags.Var(&dependencies, "depends-on", "complete replacement comma-separated dependency task IDs; empty clears")
 		flags.Var(&wakeAt, "wake-at", "hold the task off the board until this date (YYYY-MM-DD or RFC 3339); empty wakes it now")
 		flags.Var(&waitingOn, "waiting-on", "one line naming who or what the task is waiting for; empty clears")
+		flags.Var(&onTimeout, "on-timeout", "default action if the wait is unresolved at the review date; empty clears")
+		flags.Var(&contextName, "context", "execution-context tag such as home, office, or online; empty clears")
+		flags.Var(&contextCheckedAt, "context-checked-at", "when supporting context was last verified (RFC 3339); empty clears")
 		flags.Var(&expectedVersion, "expected-version", "fail if the stored task version differs")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}
 		if len(flags.Args()) != 1 {
-			fmt.Fprintln(stderr, "Usage: tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--expected-version n] <task-id>")
+			fmt.Fprintln(stderr, "Usage: tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] [--expected-version n] <task-id>")
 			return 2
 		}
 		if description.set && descriptionFile.set {
 			fmt.Fprintln(stderr, "edit task: --description and --description-file cannot be used together")
 			return 2
 		}
-		if !title.set && !description.set && !descriptionFile.set && !dependencies.set && !wakeAt.set && !waitingOn.set {
-			fmt.Fprintln(stderr, "edit task: at least one of --title, --description, --description-file, --depends-on, --wake-at, or --waiting-on is required")
+		if !title.set &&
+			!description.set &&
+			!descriptionFile.set &&
+			!dependencies.set &&
+			!wakeAt.set &&
+			!waitingOn.set &&
+			!onTimeout.set &&
+			!contextName.set &&
+			!contextCheckedAt.set {
+			fmt.Fprintln(stderr, "edit task: at least one editable field is required")
 			return 2
 		}
 
@@ -160,6 +180,15 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		}
 		if waitingOn.set {
 			input.WaitingOn = &waitingOn.value
+		}
+		if onTimeout.set {
+			input.OnTimeout = &onTimeout.value
+		}
+		if contextName.set {
+			input.Context = &contextName.value
+		}
+		if contextCheckedAt.set {
+			input.ContextCheckedAt = &contextCheckedAt.value
 		}
 		if expectedVersion.set {
 			input.ExpectedVersion = &expectedVersion.value
@@ -386,8 +415,8 @@ func readTextInput(stdin io.Reader, path string) (string, error) {
 
 func usage(output io.Writer) {
 	fmt.Fprintln(output, `Usage:
-  tasks add [--description text] [--depends-on id,id] [--wake-at date] [--waiting-on text] <title>
-  tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--expected-version n] <task-id>
+  tasks add [--description text] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] <title>
+  tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] [--expected-version n] <task-id>
   tasks query <read-only-sql>
   tasks done <task-id>
   tasks delete <task-id>

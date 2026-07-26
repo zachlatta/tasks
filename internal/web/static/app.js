@@ -10,6 +10,9 @@
   const drawerBody = document.getElementById('drawer-body');
   const toastHost = document.getElementById('toasts');
   const filterInput = document.getElementById('board-filter');
+  const contextSelect = document.getElementById('board-context');
+  const actionableCount = document.getElementById('board-actionable');
+  const actionableWord = document.getElementById('board-task-word');
 
   let dragged = null;
   let origin = null;
@@ -81,7 +84,19 @@
   // waiting on a person or a prerequisite is tallied beside it instead.
   const isSleeping = (card) => card.dataset.sleeping === '1';
 
+  function localizeTimes(root = document) {
+    root.querySelectorAll('time[data-local-time]').forEach((node) => {
+      const instant = new Date(node.dateTime);
+      if (Number.isNaN(instant.getTime())) return;
+      node.textContent = new Intl.DateTimeFormat(undefined, {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      }).format(instant);
+    });
+  }
+
   function refresh() {
+    localizeTimes();
     if (!board) return;
     applyFilter();
     board.querySelectorAll('.kanban-column').forEach((column) => {
@@ -102,23 +117,30 @@
       const empty = list.querySelector('.column-empty');
       if (empty) empty.hidden = awake.length > 0;
     });
+    const actionable = Array.from(board.querySelectorAll('.task-card'))
+      .filter((card) => !card.hidden && !isSleeping(card) && card.dataset.status !== 'done')
+      .length;
+    if (actionableCount) actionableCount.textContent = String(actionable);
+    if (actionableWord) actionableWord.textContent = actionable === 1 ? 'task' : 'tasks';
   }
 
   function applyFilter() {
     const query = (filterInput ? filterInput.value : '').trim().toLowerCase();
+    const activeContext = contextSelect ? contextSelect.value : '*';
     document.querySelectorAll('.task-card').forEach((card) => {
-      if (!query) {
-        card.hidden = false;
-        return;
-      }
+      const cardContext = card.dataset.context || '';
+      const inContext = activeContext === '*' ||
+        cardContext === '' ||
+        cardContext === activeContext;
       const title = card.querySelector('.card-title');
       const excerpt = card.querySelector('.card-excerpt');
       const haystack = [
         title ? title.textContent : '',
         excerpt ? excerpt.textContent : '',
         card.dataset.taskId || '',
+        cardContext,
       ].join(' ').toLowerCase();
-      card.hidden = !haystack.includes(query);
+      card.hidden = !inContext || (query !== '' && !haystack.includes(query));
     });
   }
 
@@ -394,6 +416,7 @@
       });
       if (!response.ok) throw new Error('Could not open that task.');
       drawerBody.innerHTML = await response.text();
+      localizeTimes(drawerBody);
     } catch (error) {
       toast(error.message, { tone: 'error' });
       return;
@@ -410,7 +433,10 @@
     const response = await fetch(`/${encodeURIComponent(id)}?partial=1`, {
       headers: { 'Accept': 'text/html' },
     });
-    if (response.ok) drawerBody.innerHTML = await response.text();
+    if (response.ok) {
+      drawerBody.innerHTML = await response.text();
+      localizeTimes(drawerBody);
+    }
   }
 
   function closeDrawer(options = {}) {
@@ -633,6 +659,25 @@
     filterInput.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape') return;
       filterInput.value = '';
+      refresh();
+    });
+  }
+  if (contextSelect) {
+    try {
+      const saved = window.localStorage.getItem('tasks.activeContext');
+      if (saved !== null && Array.from(contextSelect.options).some((option) => option.value === saved)) {
+        contextSelect.value = saved;
+      }
+    } catch (_) {
+      // Storage can be unavailable in privacy modes; the selector still works
+      // for the current page.
+    }
+    contextSelect.addEventListener('change', () => {
+      try {
+        window.localStorage.setItem('tasks.activeContext', contextSelect.value);
+      } catch (_) {
+        // Keep filtering even when the preference cannot be persisted.
+      }
       refresh();
     });
   }

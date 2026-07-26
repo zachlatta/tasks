@@ -318,12 +318,18 @@ func TestCLIEditRejectsConflictingDescriptionInputs(t *testing.T) {
 func TestCLIAddAndEditCarryTheWait(t *testing.T) {
 	const secret = "test-secret"
 	var created struct {
-		WakeAt    string `json:"wake_at"`
-		WaitingOn string `json:"waiting_on"`
+		WakeAt           string `json:"wake_at"`
+		WaitingOn        string `json:"waiting_on"`
+		OnTimeout        string `json:"on_timeout"`
+		Context          string `json:"context"`
+		ContextCheckedAt string `json:"context_checked_at"`
 	}
 	var edited struct {
-		WakeAt    *string `json:"wake_at"`
-		WaitingOn *string `json:"waiting_on"`
+		WakeAt           *string `json:"wake_at"`
+		WaitingOn        *string `json:"waiting_on"`
+		OnTimeout        *string `json:"on_timeout"`
+		Context          *string `json:"context"`
+		ContextCheckedAt *string `json:"context_checked_at"`
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -348,22 +354,42 @@ func TestCLIAddAndEditCarryTheWait(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{
-		"add", "--waiting-on", "Priya, Tom & Rae", "--wake-at", "2026-07-27", "Chase the sign-off",
+		"add",
+		"--waiting-on", "the reviewers",
+		"--wake-at", "2026-07-27",
+		"--on-timeout", "Proceed with the reviewers who replied",
+		"--context", "office",
+		"--context-checked-at", "2026-07-24T13:30:00Z",
+		"Chase the sign-off",
 	}, strings.NewReader(""), &stdout, &stderr); code != 0 {
 		t.Fatalf("add exit code = %d; stderr: %s", code, stderr.String())
 	}
-	if created.WakeAt != "2026-07-27" || created.WaitingOn != "Priya, Tom & Rae" {
+	if created.WakeAt != "2026-07-27" ||
+		created.WaitingOn != "the reviewers" ||
+		created.OnTimeout != "Proceed with the reviewers who replied" ||
+		created.Context != "office" ||
+		created.ContextCheckedAt != "2026-07-24T13:30:00Z" {
 		t.Fatalf("add sent %#v", created)
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	if code := run([]string{
-		"edit", "--wake-at", "", "--waiting-on", "", "waiting-task",
+		"edit",
+		"--wake-at", "",
+		"--waiting-on", "",
+		"--on-timeout", "",
+		"--context", "",
+		"--context-checked-at", "",
+		"waiting-task",
 	}, strings.NewReader(""), &stdout, &stderr); code != 0 {
 		t.Fatalf("edit exit code = %d; stderr: %s", code, stderr.String())
 	}
-	if edited.WakeAt == nil || *edited.WakeAt != "" || edited.WaitingOn == nil || *edited.WaitingOn != "" {
+	if edited.WakeAt == nil || *edited.WakeAt != "" ||
+		edited.WaitingOn == nil || *edited.WaitingOn != "" ||
+		edited.OnTimeout == nil || *edited.OnTimeout != "" ||
+		edited.Context == nil || *edited.Context != "" ||
+		edited.ContextCheckedAt == nil || *edited.ContextCheckedAt != "" {
 		t.Fatalf("edit sent %#v", edited)
 	}
 }

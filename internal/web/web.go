@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,10 +63,11 @@ const (
 	sessionCookieMaxAge = 400 * 24 * time.Hour
 	maxAttachmentSize   = 50 << 20
 	excerptLimit        = 180
-	// fieldWakeAt and fieldWaitingOn name the two halves of a wait in the
-	// detail panel's edit form, alongside the title and description fields.
-	fieldWakeAt    = "wake_at"
-	fieldWaitingOn = "waiting_on"
+	// The detail panel submits a wait as one edit so who, when, and the default
+	// action can never be saved as a half-configured state.
+	fieldWait             = "wait"
+	fieldContext          = "context"
+	fieldContextCheckedAt = "context_checked_at"
 )
 
 //go:embed templates/*.html static/*.css static/*.js
@@ -133,6 +135,7 @@ type pageData struct {
 	Deleted         []taskCard
 	DeletedCount    int
 	Message         string
+	Contexts        []string
 }
 
 // boardColumn is one kanban column: a workflow state plus the cards currently
@@ -178,8 +181,10 @@ type taskCard struct {
 	Moves     []moveOption
 	// DeletedRelative and DeletedTimestamp describe when a soft-deleted task
 	// left the board, for the list of deleted tasks.
-	DeletedRelative  string
-	DeletedTimestamp string
+	DeletedRelative         string
+	DeletedTimestamp        string
+	ContextCheckedRelative  string
+	ContextCheckedTimestamp string
 }
 
 // dependencyView names a prerequisite so a card can show what is holding it up
@@ -379,6 +384,7 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 	}
 	position := map[Status]int{task.StatusTodo: 0, task.StatusInProgress: 1, task.StatusDone: 2}
 	actionable := 0
+	contextSet := make(map[string]struct{})
 	for _, item := range items {
 		index, ok := position[item.Status]
 		if !ok {
@@ -394,7 +400,15 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		columns[index].Tasks = append(columns[index].Tasks, card)
+		if item.Context != "" {
+			contextSet[item.Context] = struct{}{}
+		}
 	}
+	contexts := make([]string, 0, len(contextSet))
+	for contextName := range contextSet {
+		contexts = append(contexts, contextName)
+	}
+	sort.Strings(contexts)
 	h.render(w, http.StatusOK, "index.html", pageData{
 		CSRF:            current.CSRF,
 		Columns:         columns,
@@ -402,6 +416,7 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		ActionableTasks: actionable,
 		DeletedCount:    len(deleted),
 		Message:         r.URL.Query().Get("message"),
+		Contexts:        contexts,
 	})
 }
 
@@ -463,6 +478,7 @@ func (h *handler) createTask(w http.ResponseWriter, r *http.Request) {
 		Title:        r.PostForm.Get("title"),
 		Description:  r.PostForm.Get("description"),
 		Dependencies: strings.Split(r.PostForm.Get("dependencies"), ","),
+		Context:      r.PostForm.Get("context"),
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -495,27 +511,50 @@ func (h *handler) editTask(w http.ResponseWriter, r *http.Request) {
 	case string(task.TextFieldDescription):
 		input.Description = &value
 		message = "Updated description"
-	case fieldWakeAt:
-		wake, err := h.wakeAtFromForm(r, value)
+	case fieldWait:
+		wake, err := h.wakeAtFromForm(r, r.PostForm.Get("wake_at"))
 		if err != nil {
 			h.mutationFailed(w, r, http.StatusBadRequest, err.Error())
 			return
 		}
+		waitingOn := strings.TrimSpace(r.PostForm.Get("waiting_on"))
+		onTimeout := strings.TrimSpace(r.PostForm.Get("on_timeout"))
 		input.WakeAt = wake
+		input.WaitingOn = &waitingOn
+		input.OnTimeout = &onTimeout
 		if wake.IsZero() {
 			message = "Back on the board"
 		} else {
 			message = "Waiting until " + wake.Format("Jan 2")
 		}
-	case fieldWaitingOn:
+	case fieldContext:
 		trimmed := strings.TrimSpace(value)
-		input.WaitingOn = &trimmed
-		message = "Updated who this is waiting on"
+		input.Context = &trimmed
+		message = "Updated execution context"
 		if trimmed == "" {
-			message = "Cleared who this is waiting on"
+			message = "Cleared execution context"
 		}
+	case fieldContextCheckedAt:
+		var checkedAt *time.Time
+		switch strings.TrimSpace(value) {
+		case "":
+			checkedAt = new(time.Time)
+			message = "Cleared context check time"
+		case "now":
+			now := h.now().UTC()
+			checkedAt = &now
+			message = "Marked context checked now"
+		default:
+			checkedAt, err = task.ParseContextCheckedAt(value)
+			if err != nil {
+				h.mutationFailed(w, r, http.StatusBadRequest, err.Error())
+				return
+			}
+			message = "Updated context check time"
+		}
+		input.ContextCheckedAt = checkedAt
 	default:
-		h.mutationFailed(w, r, http.StatusBadRequest, "field must be title, description, wake_at, or waiting_on")
+		h.mutationFailed(w, r, http.StatusBadRequest, "field must be title, description, wait, context, or context_checked_at")
 		return
 	}
 
@@ -746,7 +785,11 @@ func (h *handler) newTaskCard(item task.Task, csrf string, lookup func(string) (
 		StatusLabel: statusLabel(item.Status),
 		Excerpt:     excerpt(item.Description),
 		Relative:    h.relativeTime(item.UpdatedAt),
-		Timestamp:   item.UpdatedAt.Format(time.RFC3339),
+		Timestamp:   item.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	if item.ContextCheckedAt != nil {
+		card.ContextCheckedRelative = h.relativeTime(*item.ContextCheckedAt)
+		card.ContextCheckedTimestamp = item.ContextCheckedAt.UTC().Format(time.RFC3339)
 	}
 	if item.Deleted() {
 		card.DeletedRelative = h.relativeTime(*item.DeletedAt)

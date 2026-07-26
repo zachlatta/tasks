@@ -134,5 +134,13 @@ func clone(item task.Task) task.Task {
 		deletedAt := *item.DeletedAt
 		item.DeletedAt = &deletedAt
 	}
+	if item.WakeAt != nil {
+		wakeAt := *item.WakeAt
+		item.WakeAt = &wakeAt
+	}
+	if item.ContextCheckedAt != nil {
+		checkedAt := *item.ContextCheckedAt
+		item.ContextCheckedAt = &checkedAt
+	}
 	return item
 }

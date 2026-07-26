@@ -38,7 +38,7 @@ func NewWithTools(tools *taskapi.Tools, version string) *mcp.Server {
 		Name:  taskapi.QueryTasksSQLTool,
 		Title: "Query tasks with read-only SQL",
 		Description: "Runs trusted, read-only PostgreSQL queries. Tables: tasks, dependencies, images, task_revisions. " +
-			"View: task_overview, which adds blocked, snoozed, and sleeping flags plus wake_at, waiting_on, and snooze_count. " +
+			"View: task_overview, which adds blocked, snoozed, and sleeping flags plus wait and execution-context fields. " +
 			"Results are capped at 500 rows. Inspect the schema via information_schema.columns.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input SQLQueryInput) (*mcp.CallToolResult, SQLQueryOutput, error) {
@@ -49,7 +49,8 @@ func NewWithTools(tools *taskapi.Tools, version string) *mcp.Server {
 		Name:  taskapi.CreateTaskTool,
 		Title: "Create a task",
 		Description: "Creates a todo task in the shared Postgres backend. Dependencies must name existing task IDs. " +
-			"Set wake_at and waiting_on to capture work that is already waiting on someone; it stays off the board until that date arrives.",
+			"Set waiting_on with a wake_at (or dependency), and optionally on_timeout, to capture a complete wait. " +
+			"Context is a lightweight tag such as home, office, or online; context_checked_at records an explicit verification.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPointer(false), OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input CreateTaskInput) (*mcp.CallToolResult, task.Task, error) {
 		created, err := tools.CreateTask(mutationContext(ctx), input)
@@ -70,8 +71,9 @@ func NewWithTools(tools *taskapi.Tools, version string) *mcp.Server {
 		Name:  taskapi.UpdateTaskTool,
 		Title: "Replace task fields",
 		Description: "Atomically replaces any supplied mutable fields: title, description, the complete dependency list, " +
-			"and/or the wait (wake_at and waiting_on). " +
-			"Omitted fields stay unchanged; an empty description, dependency list, wake date, or waiting-on note clears that field. " +
+			"the complete wait (wake_at, waiting_on, and on_timeout), and/or execution-context metadata. " +
+			"Omitted fields stay unchanged; supplied empty values clear their fields. " +
+			"A named wait must retain a wake date or dependency review trigger. " +
 			"A task with a future wake_at or an unfinished dependency is held off the board until it wakes. " +
 			"Status and attachments are preserved. Use query_tasks_sql to read the current task and version first.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPointer(true), OpenWorldHint: &closedWorld},

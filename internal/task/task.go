@@ -49,13 +49,23 @@ type Task struct {
 	// WaitingOn names who or what the task is waiting for, in one line. It is
 	// the reason a wake date exists and is shown wherever the task is.
 	WaitingOn string `json:"waiting_on,omitempty" yaml:"waiting_on,omitempty"`
+	// OnTimeout is the default action to take if the wait has not resolved by
+	// WakeAt. Keeping it with the wait makes the review a decision, not another
+	// round of reconstructing context.
+	OnTimeout string `json:"on_timeout,omitempty" yaml:"on_timeout,omitempty"`
 	// SnoozeCount counts how many times the wake date has been pushed out
 	// without the task being finished, so a thread nobody is going to answer
 	// stops looking like one that is merely early.
-	SnoozeCount int       `json:"snooze_count,omitempty" yaml:"snooze_count,omitempty"`
-	CreatedAt   time.Time `json:"created_at" yaml:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at" yaml:"updated_at"`
-	Version     int64     `json:"version" yaml:"version"`
+	SnoozeCount int `json:"snooze_count,omitempty" yaml:"snooze_count,omitempty"`
+	// Context is a lightweight execution constraint such as home, office, or
+	// online. It is deliberately a tag rather than a precise location.
+	Context string `json:"context,omitempty" yaml:"context,omitempty"`
+	// ContextCheckedAt records when a person last verified the task's
+	// supporting context. Ordinary task edits do not change it.
+	ContextCheckedAt *time.Time `json:"context_checked_at,omitempty" yaml:"context_checked_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at" yaml:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at" yaml:"updated_at"`
+	Version          int64      `json:"version" yaml:"version"`
 	// DeletedAt marks a soft-deleted task. The row and its whole revision
 	// history stay; the task simply leaves the board and every read until it is
 	// restored. Nil means the task is live.
@@ -108,6 +118,25 @@ func ParseWakeAt(value string) (*time.Time, error) {
 	)
 }
 
+// ParseContextCheckedAt turns an RFC 3339 timestamp into an optional instant.
+// Unlike a wake date, a context check describes an event that already happened,
+// so a bare calendar date would be needlessly ambiguous.
+func ParseContextCheckedAt(value string) (*time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: context checked timestamp %q must be RFC 3339",
+			ErrInvalid, value,
+		)
+	}
+	parsed = parsed.UTC()
+	return &parsed, nil
+}
+
 // positionGap is the spacing a task claims when it lands at the top or bottom
 // of a column. Landing between two cards takes the midpoint of its neighbors
 // instead, so a single row changes per move.
@@ -129,6 +158,12 @@ type CreateInput struct {
 	WakeAt *time.Time `json:"wake_at,omitempty"`
 	// WaitingOn names who or what the new task is waiting for.
 	WaitingOn string `json:"waiting_on,omitempty"`
+	// OnTimeout is what to do if the wait is unresolved at WakeAt.
+	OnTimeout string `json:"on_timeout,omitempty"`
+	// Context is an optional, lightweight execution-context tag.
+	Context string `json:"context,omitempty"`
+	// ContextCheckedAt is when the supporting context was last verified.
+	ContextCheckedAt *time.Time `json:"context_checked_at,omitempty"`
 }
 
 type TextField string
@@ -160,9 +195,18 @@ type EditInput struct {
 	WakeAt *time.Time
 	// WaitingOn supplies a new one-line reason when non-nil; an empty string
 	// clears it.
-	WaitingOn       *string
-	Replacements    []TextReplacement
-	ExpectedVersion *int64
+	WaitingOn *string
+	// OnTimeout supplies the default action at the review date when non-nil; an
+	// empty string clears it.
+	OnTimeout *string
+	// Context supplies a new execution-context tag when non-nil; an empty string
+	// clears it.
+	Context *string
+	// ContextCheckedAt supplies a new verification timestamp when non-nil. A
+	// zero time clears it.
+	ContextCheckedAt *time.Time
+	Replacements     []TextReplacement
+	ExpectedVersion  *int64
 }
 
 // AuditMetadata describes who initiated a task mutation and through which
@@ -220,14 +264,19 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Task, error) {
 	}
 	position, _ := positionAt(todo, 0)
 	now := s.now().UTC()
+	contextName, err := normalizeContext(input.Context)
+	if err != nil {
+		return Task{}, err
+	}
 	created := Task{
-		ID:           s.newID(),
 		Title:        input.Title,
 		Description:  input.Description,
 		Status:       StatusTodo,
 		Position:     position,
 		Dependencies: dependencies,
 		WaitingOn:    strings.TrimSpace(input.WaitingOn),
+		OnTimeout:    strings.TrimSpace(input.OnTimeout),
+		Context:      contextName,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 		Version:      1,
@@ -238,6 +287,14 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Task, error) {
 		// Capturing something already asleep is the first time it was set aside.
 		created.SnoozeCount = 1
 	}
+	if input.ContextCheckedAt != nil && !input.ContextCheckedAt.IsZero() {
+		checkedAt := input.ContextCheckedAt.UTC()
+		created.ContextCheckedAt = &checkedAt
+	}
+	if err := validateWait(created); err != nil {
+		return Task{}, err
+	}
+	created.ID = s.newID()
 	if created.ID == "" {
 		return Task{}, fmt.Errorf("%w: generated ID is empty", ErrInvalid)
 	}
@@ -343,6 +400,9 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 		input.Dependencies == nil &&
 		input.WakeAt == nil &&
 		input.WaitingOn == nil &&
+		input.OnTimeout == nil &&
+		input.Context == nil &&
+		input.ContextCheckedAt == nil &&
 		len(input.Replacements) == 0 {
 		return Task{}, fmt.Errorf("%w: at least one edit is required", ErrInvalid)
 	}
@@ -382,6 +442,24 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 	if input.WaitingOn != nil {
 		edited.WaitingOn = strings.TrimSpace(*input.WaitingOn)
 	}
+	if input.OnTimeout != nil {
+		edited.OnTimeout = strings.TrimSpace(*input.OnTimeout)
+	}
+	if input.Context != nil {
+		contextName, err := normalizeContext(*input.Context)
+		if err != nil {
+			return Task{}, err
+		}
+		edited.Context = contextName
+	}
+	if input.ContextCheckedAt != nil {
+		if input.ContextCheckedAt.IsZero() {
+			edited.ContextCheckedAt = nil
+		} else {
+			checkedAt := input.ContextCheckedAt.UTC()
+			edited.ContextCheckedAt = &checkedAt
+		}
+	}
 	for index, replacement := range input.Replacements {
 		if err := applyTextReplacement(&edited, replacement); err != nil {
 			return Task{}, fmt.Errorf("replacement %d: %w", index+1, err)
@@ -397,11 +475,19 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 			return Task{}, err
 		}
 	}
+	if input.Dependencies != nil || input.WakeAt != nil || input.WaitingOn != nil || input.OnTimeout != nil {
+		if err := validateWait(edited); err != nil {
+			return Task{}, err
+		}
+	}
 	if edited.Title == current.Title &&
 		edited.Description == current.Description &&
 		slices.Equal(edited.Dependencies, current.Dependencies) &&
 		sameInstant(edited.WakeAt, current.WakeAt) &&
-		edited.WaitingOn == current.WaitingOn {
+		edited.WaitingOn == current.WaitingOn &&
+		edited.OnTimeout == current.OnTimeout &&
+		edited.Context == current.Context &&
+		sameInstant(edited.ContextCheckedAt, current.ContextCheckedAt) {
 		return clone(current), nil
 	}
 
@@ -733,6 +819,35 @@ func sameInstant(first, second *time.Time) bool {
 	return first.Equal(*second)
 }
 
+func validateWait(item Task) error {
+	hasReview := item.WakeAt != nil || len(item.Dependencies) > 0
+	if item.WaitingOn != "" && !hasReview {
+		return fmt.Errorf(
+			"%w: a task waiting on someone needs a wake date or dependency review trigger",
+			ErrInvalid,
+		)
+	}
+	if item.OnTimeout != "" && !hasReview {
+		return fmt.Errorf(
+			"%w: an on-timeout action needs a wake date or dependency review trigger",
+			ErrInvalid,
+		)
+	}
+	return nil
+}
+
+func normalizeContext(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	value = strings.TrimSpace(strings.TrimPrefix(value, "@"))
+	if strings.ContainsAny(value, "\r\n") {
+		return "", fmt.Errorf("%w: context must fit on one line", ErrInvalid)
+	}
+	if len([]rune(value)) > 64 {
+		return "", fmt.Errorf("%w: context must be 64 characters or fewer", ErrInvalid)
+	}
+	return strings.ToLower(value), nil
+}
+
 func clone(item Task) Task {
 	item.Dependencies = slices.Clone(item.Dependencies)
 	item.Attachments = slices.Clone(item.Attachments)
@@ -743,6 +858,10 @@ func clone(item Task) Task {
 	if item.WakeAt != nil {
 		wake := *item.WakeAt
 		item.WakeAt = &wake
+	}
+	if item.ContextCheckedAt != nil {
+		checkedAt := *item.ContextCheckedAt
+		item.ContextCheckedAt = &checkedAt
 	}
 	return item
 }

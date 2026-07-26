@@ -368,8 +368,9 @@ func TestUpdateTaskSetsAndClearsTheWait(t *testing.T) {
 		{name: "offset timestamp", raw: "2026-07-29T09:00:00-04:00", want: time.Date(2026, time.July, 29, 13, 0, 0, 0, time.UTC)},
 	} {
 		waitingOn := "Priya, Tom & Rae"
+		onTimeout := "Proceed with the reviewers who replied"
 		edited, err := tools.UpdateTask(context.Background(), UpdateTaskInput{
-			ID: created.ID, WakeAt: &supplied.raw, WaitingOn: &waitingOn,
+			ID: created.ID, WakeAt: &supplied.raw, WaitingOn: &waitingOn, OnTimeout: &onTimeout,
 		})
 		if err != nil {
 			t.Fatalf("UpdateTask with a %s wake date: %v", supplied.name, err)
@@ -380,16 +381,19 @@ func TestUpdateTaskSetsAndClearsTheWait(t *testing.T) {
 		if edited.WaitingOn != waitingOn {
 			t.Fatalf("%s waiting on = %q", supplied.name, edited.WaitingOn)
 		}
+		if edited.OnTimeout != onTimeout {
+			t.Fatalf("%s on timeout = %q", supplied.name, edited.OnTimeout)
+		}
 	}
 
 	empty := ""
 	awake, err := tools.UpdateTask(context.Background(), UpdateTaskInput{
-		ID: created.ID, WakeAt: &empty, WaitingOn: &empty,
+		ID: created.ID, WakeAt: &empty, WaitingOn: &empty, OnTimeout: &empty,
 	})
 	if err != nil {
 		t.Fatalf("UpdateTask clearing the wait: %v", err)
 	}
-	if awake.WakeAt != nil || awake.WaitingOn != "" {
+	if awake.WakeAt != nil || awake.WaitingOn != "" || awake.OnTimeout != "" {
 		t.Fatalf("clearing the wait left %#v", awake)
 	}
 }
@@ -423,7 +427,9 @@ func TestCreateTaskAcceptsAWait(t *testing.T) {
 		return postgres.Result{}, nil
 	}))
 	created, err := tools.CreateTask(context.Background(), CreateTaskInput{
-		Title: "Chase the signed contract", WakeAt: "2026-08-03", WaitingOn: "the vendor",
+		Title:  "Chase the signed contract",
+		WakeAt: "2026-08-03", WaitingOn: "the vendor", OnTimeout: "Send a final reminder",
+		Context: "@Office", ContextCheckedAt: "2026-07-24T09:30:00-04:00",
 	})
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
@@ -432,10 +438,76 @@ func TestCreateTaskAcceptsAWait(t *testing.T) {
 	if created.WakeAt == nil || !created.WakeAt.Equal(want) {
 		t.Fatalf("wake date = %v, want %v", created.WakeAt, want)
 	}
-	if created.WaitingOn != "the vendor" || created.SnoozeCount != 1 {
+	if created.WaitingOn != "the vendor" || created.OnTimeout != "Send a final reminder" || created.SnoozeCount != 1 {
 		t.Fatalf("created wait = %q, snoozes = %d", created.WaitingOn, created.SnoozeCount)
+	}
+	if created.Context != "office" {
+		t.Fatalf("context = %q, want office", created.Context)
+	}
+	wantChecked := time.Date(2026, time.July, 24, 13, 30, 0, 0, time.UTC)
+	if created.ContextCheckedAt == nil || !created.ContextCheckedAt.Equal(wantChecked) {
+		t.Fatalf("context checked at = %v, want %v", created.ContextCheckedAt, wantChecked)
 	}
 	if !created.Snoozed(now) {
 		t.Fatal("a task created with a future wake date should start asleep")
+	}
+}
+
+func TestUpdateTaskSetsAndClearsContextMetadata(t *testing.T) {
+	t.Parallel()
+
+	repo := tasktest.NewRepository()
+	service := task.NewService(repo, time.Now, func() string { return "context-task" })
+	tools := NewTools(service, readerFunc(func(context.Context, string) (postgres.Result, error) {
+		return postgres.Result{}, nil
+	}))
+	created, err := tools.CreateTask(context.Background(), CreateTaskInput{Title: "Pick up supplies"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	contextName := " @SHOP "
+	checked := "2026-07-24T13:30:00-04:00"
+	edited, err := tools.UpdateTask(context.Background(), UpdateTaskInput{
+		ID: created.ID, Context: &contextName, ContextCheckedAt: &checked,
+	})
+	if err != nil {
+		t.Fatalf("UpdateTask: %v", err)
+	}
+	wantChecked := time.Date(2026, time.July, 24, 17, 30, 0, 0, time.UTC)
+	if edited.Context != "shop" || edited.ContextCheckedAt == nil || !edited.ContextCheckedAt.Equal(wantChecked) {
+		t.Fatalf("context metadata = %#v", edited)
+	}
+
+	empty := ""
+	cleared, err := tools.UpdateTask(context.Background(), UpdateTaskInput{
+		ID: created.ID, Context: &empty, ContextCheckedAt: &empty,
+	})
+	if err != nil {
+		t.Fatalf("clear context metadata: %v", err)
+	}
+	if cleared.Context != "" || cleared.ContextCheckedAt != nil {
+		t.Fatalf("clearing context metadata left %#v", cleared)
+	}
+}
+
+func TestToolsRejectAnUnparsableContextCheckTimestamp(t *testing.T) {
+	t.Parallel()
+
+	repo := tasktest.NewRepository()
+	service := task.NewService(repo, time.Now, func() string { return "bad-context-check" })
+	tools := NewTools(service, readerFunc(func(context.Context, string) (postgres.Result, error) {
+		return postgres.Result{}, nil
+	}))
+	created, err := tools.CreateTask(context.Background(), CreateTaskInput{Title: "Check source"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	invalid := "yesterday afternoon"
+	if _, err := tools.UpdateTask(context.Background(), UpdateTaskInput{
+		ID: created.ID, ContextCheckedAt: &invalid,
+	}); !errors.Is(err, task.ErrInvalid) {
+		t.Fatalf("UpdateTask error = %v, want ErrInvalid", err)
 	}
 }

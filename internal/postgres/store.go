@@ -55,7 +55,13 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 -- stored before waits existed have no date and are awake, which is the default.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS wake_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS waiting_on TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS on_timeout TEXT NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS snooze_count INTEGER NOT NULL DEFAULT 0;
+-- Context is a lightweight execution tag (for example home or office), never
+-- precise location data. Its check timestamp changes only when explicitly
+-- verified, independently from the task's ordinary updated_at.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS context TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS context_checked_at TIMESTAMPTZ;
 -- Tasks stored before the board could be reordered by hand all share position
 -- zero. Spread them out once, keeping the newest-first order they were shown in.
 DO $$
@@ -115,6 +121,7 @@ CREATE TABLE IF NOT EXISTS task_revisions (
 CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status);
 CREATE INDEX IF NOT EXISTS tasks_deleted_at_idx ON tasks(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS tasks_wake_at_idx ON tasks(wake_at) WHERE wake_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS tasks_context_idx ON tasks(context) WHERE context <> '';
 CREATE INDEX IF NOT EXISTS dependencies_depends_on_idx ON dependencies(depends_on_id);
 CREATE INDEX IF NOT EXISTS task_revisions_occurred_at_idx ON task_revisions(occurred_at, revision_id);
 CREATE OR REPLACE FUNCTION reject_task_revision_mutation()
@@ -158,7 +165,10 @@ SELECT
 	) OR (t.wake_at IS NOT NULL AND t.wake_at > now()) THEN 1 ELSE 0 END AS sleeping,
 	t.wake_at,
 	t.waiting_on,
+	t.on_timeout,
 	t.snooze_count,
+	t.context,
+	t.context_checked_at,
 	(SELECT count(*) FROM dependencies d WHERE d.task_id = t.id) AS dependency_count,
 	(SELECT count(*) FROM images i WHERE i.task_id = t.id) AS image_count,
 	t.version,
@@ -244,7 +254,7 @@ func (s *Store) SetMaxRows(maximum int) {
 
 // taskColumns is the stored task projection every read shares, in the order
 // scanTask expects.
-const taskColumns = `id, title, description, status, position, wake_at, waiting_on, snooze_count, created_at, updated_at, version, deleted_at`
+const taskColumns = `id, title, description, status, position, wake_at, waiting_on, on_timeout, snooze_count, context, context_checked_at, created_at, updated_at, version, deleted_at`
 
 // Create inserts a new task and its dependencies and images atomically.
 func (s *Store) Create(ctx context.Context, item task.Task) error {
@@ -257,12 +267,13 @@ func (s *Store) Create(ctx context.Context, item task.Task) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO tasks (
-				id, title, description, status, position, wake_at, waiting_on, snooze_count,
-				created_at, updated_at, version, deleted_at
+				id, title, description, status, position, wake_at, waiting_on, on_timeout,
+				snooze_count, context, context_checked_at, created_at, updated_at, version, deleted_at
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		`, item.ID, item.Title, item.Description, string(item.Status), item.Position,
-			item.WakeAt, item.WaitingOn, item.SnoozeCount,
+			item.WakeAt, item.WaitingOn, item.OnTimeout, item.SnoozeCount,
+			item.Context, item.ContextCheckedAt,
 			item.CreatedAt, item.UpdatedAt, item.Version, item.DeletedAt)
 		if err != nil {
 			if isUniqueViolation(err) {
@@ -292,11 +303,13 @@ func (s *Store) Update(ctx context.Context, item task.Task) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE tasks
 			SET title = $2, description = $3, status = $4, position = $5,
-				wake_at = $6, waiting_on = $7, snooze_count = $8,
-				updated_at = $9, version = $10, deleted_at = $11
-			WHERE id = $1 AND version = $12
+				wake_at = $6, waiting_on = $7, on_timeout = $8, snooze_count = $9,
+				context = $10, context_checked_at = $11,
+				updated_at = $12, version = $13, deleted_at = $14
+			WHERE id = $1 AND version = $15
 		`, item.ID, item.Title, item.Description, string(item.Status), item.Position,
-			item.WakeAt, item.WaitingOn, item.SnoozeCount,
+			item.WakeAt, item.WaitingOn, item.OnTimeout, item.SnoozeCount,
+			item.Context, item.ContextCheckedAt,
 			item.UpdatedAt, item.Version, item.DeletedAt, before.Version)
 		if err != nil {
 			return err
@@ -638,7 +651,8 @@ func scanTask(row pgx.Row) (task.Task, error) {
 	var status string
 	err := row.Scan(
 		&item.ID, &item.Title, &item.Description, &status, &item.Position,
-		&item.WakeAt, &item.WaitingOn, &item.SnoozeCount,
+		&item.WakeAt, &item.WaitingOn, &item.OnTimeout, &item.SnoozeCount,
+		&item.Context, &item.ContextCheckedAt,
 		&item.CreatedAt, &item.UpdatedAt, &item.Version, &item.DeletedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -657,6 +671,10 @@ func scanTask(row pgx.Row) (task.Task, error) {
 	if item.WakeAt != nil {
 		wakeAt := item.WakeAt.UTC()
 		item.WakeAt = &wakeAt
+	}
+	if item.ContextCheckedAt != nil {
+		checkedAt := item.ContextCheckedAt.UTC()
+		item.ContextCheckedAt = &checkedAt
 	}
 	return item, nil
 }

@@ -1155,7 +1155,13 @@ func TestStoreRoundTripsTheWait(t *testing.T) {
 	}
 	wake := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
 	waitingOn := "Priya, Tom & Rae (asked Mar 4)"
-	if _, err := service.Edit(ctx, created.ID, task.EditInput{WakeAt: &wake, WaitingOn: &waitingOn}); err != nil {
+	onTimeout := "Proceed with the reviewers who replied"
+	contextName := "office"
+	checkedAt := time.Date(2026, time.July, 24, 9, 30, 0, 0, time.FixedZone("UTC-4", -4*60*60))
+	if _, err := service.Edit(ctx, created.ID, task.EditInput{
+		WakeAt: &wake, WaitingOn: &waitingOn, OnTimeout: &onTimeout,
+		Context: &contextName, ContextCheckedAt: &checkedAt,
+	}); err != nil {
 		t.Fatalf("Edit: %v", err)
 	}
 
@@ -1169,17 +1175,35 @@ func TestStoreRoundTripsTheWait(t *testing.T) {
 	if loaded.WaitingOn != waitingOn || loaded.SnoozeCount != 1 {
 		t.Fatalf("waiting on = %q, snoozes = %d", loaded.WaitingOn, loaded.SnoozeCount)
 	}
+	if loaded.OnTimeout != onTimeout || loaded.Context != contextName {
+		t.Fatalf("on timeout = %q, context = %q", loaded.OnTimeout, loaded.Context)
+	}
+	if loaded.ContextCheckedAt == nil ||
+		loaded.ContextCheckedAt.Location() != time.UTC ||
+		!loaded.ContextCheckedAt.Equal(checkedAt) {
+		t.Fatalf("context checked at = %v, want %v in UTC", loaded.ContextCheckedAt, checkedAt)
+	}
 
 	listed, err := store.Tasks(ctx)
 	if err != nil {
 		t.Fatalf("Tasks: %v", err)
 	}
-	if len(listed) != 1 || listed[0].WakeAt == nil || !listed[0].WakeAt.Equal(wake) || listed[0].WaitingOn != waitingOn {
+	if len(listed) != 1 ||
+		listed[0].WakeAt == nil ||
+		!listed[0].WakeAt.Equal(wake) ||
+		listed[0].WaitingOn != waitingOn ||
+		listed[0].OnTimeout != onTimeout ||
+		listed[0].Context != contextName ||
+		listed[0].ContextCheckedAt == nil ||
+		!listed[0].ContextCheckedAt.Equal(checkedAt) {
 		t.Fatalf("board projection dropped the wait: %#v", listed)
 	}
 
 	var cleared time.Time
-	if _, err := service.Edit(ctx, created.ID, task.EditInput{WakeAt: &cleared}); err != nil {
+	empty := ""
+	if _, err := service.Edit(ctx, created.ID, task.EditInput{
+		WakeAt: &cleared, WaitingOn: &empty, OnTimeout: &empty,
+	}); err != nil {
 		t.Fatalf("Edit to clear: %v", err)
 	}
 	awake, err := store.Get(ctx, created.ID)
@@ -1223,7 +1247,7 @@ func TestTaskOverviewReportsSleepingTasks(t *testing.T) {
 	}
 
 	result, err := store.Query(ctx, `
-		SELECT id, blocked, snoozed, sleeping, waiting_on, snooze_count
+		SELECT id, blocked, snoozed, sleeping, waiting_on, on_timeout, context, context_checked_at, snooze_count
 		FROM task_overview ORDER BY id
 	`)
 	if err != nil {
@@ -1306,7 +1330,12 @@ func TestOpenAddsWaitColumnsToAnExistingDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if loaded.WakeAt != nil || loaded.WaitingOn != "" || loaded.SnoozeCount != 0 {
+	if loaded.WakeAt != nil ||
+		loaded.WaitingOn != "" ||
+		loaded.OnTimeout != "" ||
+		loaded.Context != "" ||
+		loaded.ContextCheckedAt != nil ||
+		loaded.SnoozeCount != 0 {
 		t.Fatalf("migrated task should be awake, got %#v", loaded)
 	}
 }

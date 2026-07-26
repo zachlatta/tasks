@@ -36,11 +36,14 @@ type SQLQueryOutput struct {
 }
 
 type CreateTaskInput struct {
-	Title        string   `json:"title" jsonschema:"Short, required title for the task."`
-	Description  string   `json:"description,omitempty" jsonschema:"Optional Markdown task description."`
-	Dependencies []string `json:"dependencies,omitempty" jsonschema:"IDs of tasks that must be done first."`
-	WakeAt       string   `json:"wake_at,omitempty" jsonschema:"Optional date the task should return to the board, as YYYY-MM-DD (midnight UTC) or an RFC 3339 timestamp. Until then the task is captured but held off the board."`
-	WaitingOn    string   `json:"waiting_on,omitempty" jsonschema:"Optional one-line note naming who or what the task is waiting for."`
+	Title            string   `json:"title" jsonschema:"Short, required title for the task."`
+	Description      string   `json:"description,omitempty" jsonschema:"Optional Markdown task description."`
+	Dependencies     []string `json:"dependencies,omitempty" jsonschema:"IDs of tasks that must be done first."`
+	WakeAt           string   `json:"wake_at,omitempty" jsonschema:"Optional date the task should return to the board, as YYYY-MM-DD (midnight UTC) or an RFC 3339 timestamp. Until then the task is captured but held off the board."`
+	WaitingOn        string   `json:"waiting_on,omitempty" jsonschema:"Optional one-line note naming who or what the task is waiting for. A named wait must also have wake_at or a dependency review trigger."`
+	OnTimeout        string   `json:"on_timeout,omitempty" jsonschema:"Optional default action to take if the wait is unresolved at wake_at."`
+	Context          string   `json:"context,omitempty" jsonschema:"Optional lightweight execution-context tag such as home, office, or online. A leading @ is optional."`
+	ContextCheckedAt string   `json:"context_checked_at,omitempty" jsonschema:"Optional RFC 3339 timestamp recording when the task's supporting context was last verified."`
 }
 
 type CompleteTaskInput struct {
@@ -56,13 +59,16 @@ type RestoreTaskInput struct {
 }
 
 type UpdateTaskInput struct {
-	ID              string    `json:"id" jsonschema:"ID of the task to update."`
-	ExpectedVersion *int64    `json:"expected_version,omitempty" jsonschema:"Optional version from a prior read. The edit fails instead of overwriting a newer task when it does not match."`
-	Title           *string   `json:"title,omitempty" jsonschema:"Optional complete replacement title. Whitespace is trimmed and the result must not be blank."`
-	Description     *string   `json:"description,omitempty" jsonschema:"Optional complete replacement Markdown description. An empty string clears it."`
-	Dependencies    *[]string `json:"dependencies,omitempty" jsonschema:"Optional complete replacement dependency ID list. An empty list clears all dependencies."`
-	WakeAt          *string   `json:"wake_at,omitempty" jsonschema:"Optional date the task should return to the board, as YYYY-MM-DD (midnight UTC) or an RFC 3339 timestamp. An empty string clears it and wakes the task now."`
-	WaitingOn       *string   `json:"waiting_on,omitempty" jsonschema:"Optional one-line note naming who or what the task is waiting for. An empty string clears it."`
+	ID               string    `json:"id" jsonschema:"ID of the task to update."`
+	ExpectedVersion  *int64    `json:"expected_version,omitempty" jsonschema:"Optional version from a prior read. The edit fails instead of overwriting a newer task when it does not match."`
+	Title            *string   `json:"title,omitempty" jsonschema:"Optional complete replacement title. Whitespace is trimmed and the result must not be blank."`
+	Description      *string   `json:"description,omitempty" jsonschema:"Optional complete replacement Markdown description. An empty string clears it."`
+	Dependencies     *[]string `json:"dependencies,omitempty" jsonschema:"Optional complete replacement dependency ID list. An empty list clears all dependencies."`
+	WakeAt           *string   `json:"wake_at,omitempty" jsonschema:"Optional date the task should return to the board, as YYYY-MM-DD (midnight UTC) or an RFC 3339 timestamp. An empty string clears it and wakes the task now."`
+	WaitingOn        *string   `json:"waiting_on,omitempty" jsonschema:"Optional one-line note naming who or what the task is waiting for. An empty string clears it."`
+	OnTimeout        *string   `json:"on_timeout,omitempty" jsonschema:"Optional default action if the wait is unresolved at wake_at. An empty string clears it."`
+	Context          *string   `json:"context,omitempty" jsonschema:"Optional lightweight execution-context tag such as home, office, or online. A leading @ is optional and an empty string clears it."`
+	ContextCheckedAt *string   `json:"context_checked_at,omitempty" jsonschema:"Optional RFC 3339 timestamp recording when supporting context was last verified. An empty string clears it."`
 }
 
 type EditTaskTextInput struct {
@@ -95,12 +101,19 @@ func (t *Tools) CreateTask(ctx context.Context, input CreateTaskInput) (task.Tas
 	if err != nil {
 		return task.Task{}, err
 	}
+	contextCheckedAt, err := task.ParseContextCheckedAt(input.ContextCheckedAt)
+	if err != nil {
+		return task.Task{}, err
+	}
 	return t.tasks.Create(ctx, task.CreateInput{
-		Title:        input.Title,
-		Description:  input.Description,
-		Dependencies: input.Dependencies,
-		WakeAt:       wakeAt,
-		WaitingOn:    input.WaitingOn,
+		Title:            input.Title,
+		Description:      input.Description,
+		Dependencies:     input.Dependencies,
+		WakeAt:           wakeAt,
+		WaitingOn:        input.WaitingOn,
+		OnTimeout:        input.OnTimeout,
+		Context:          input.Context,
+		ContextCheckedAt: contextCheckedAt,
 	})
 }
 
@@ -116,6 +129,8 @@ func (t *Tools) UpdateTask(ctx context.Context, input UpdateTaskInput) (task.Tas
 		Description:     input.Description,
 		Dependencies:    input.Dependencies,
 		WaitingOn:       input.WaitingOn,
+		OnTimeout:       input.OnTimeout,
+		Context:         input.Context,
 		ExpectedVersion: input.ExpectedVersion,
 	}
 	if input.WakeAt != nil {
@@ -129,6 +144,16 @@ func (t *Tools) UpdateTask(ctx context.Context, input UpdateTaskInput) (task.Tas
 			wakeAt = new(time.Time)
 		}
 		edit.WakeAt = wakeAt
+	}
+	if input.ContextCheckedAt != nil {
+		contextCheckedAt, err := task.ParseContextCheckedAt(*input.ContextCheckedAt)
+		if err != nil {
+			return task.Task{}, err
+		}
+		if contextCheckedAt == nil {
+			contextCheckedAt = new(time.Time)
+		}
+		edit.ContextCheckedAt = contextCheckedAt
 	}
 	return t.tasks.Edit(ctx, input.ID, edit)
 }

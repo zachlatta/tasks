@@ -15,7 +15,7 @@
   </form>
 </header>{{end}}
 
-{{define "task-card"}}<article class="task-card" data-task-id="{{.ID}}" data-status="{{.Status}}" data-sleeping="{{if .Sleeping}}1{{else}}0{{end}}" draggable="true" tabindex="0" aria-label="{{plainTitle .Title}}, {{.StatusLabel}}{{if .Sleeping}}, waiting{{end}}">
+{{define "task-card"}}<article class="task-card" data-task-id="{{.ID}}" data-status="{{.Status}}" data-sleeping="{{if .Sleeping}}1{{else}}0{{end}}" data-context="{{.Context}}" draggable="true" tabindex="0" aria-label="{{plainTitle .Title}}, {{.StatusLabel}}{{if .Sleeping}}, waiting{{end}}">
   <a class="card-title" href="/{{.ID}}" draggable="false">{{renderInlineMarkdown .Title}}</a>
   {{with .Excerpt}}<p class="card-excerpt">{{.}}</p>{{end}}
   {{with .Cover}}<img class="card-cover" src="/attachments/{{.Key}}" alt="" loading="lazy" draggable="false">{{end}}
@@ -28,6 +28,7 @@
   <div class="card-meta">
     <code class="task-id">{{.ID}}</code>
     {{if and .Blocked (not .Sleeping)}}<span class="chip chip-blocked">Blocked</span>{{end}}
+    {{with .Context}}<span class="chip chip-context">@{{.}}</span>{{end}}
     {{if .DependsOn}}<span class="chip">{{len .DependsOn}} dep{{if gt (len .DependsOn) 1}}s{{end}}</span>{{end}}
     {{if .Attachments}}<span class="chip">{{len .Attachments}} file{{if gt (len .Attachments) 1}}s{{end}}</span>{{end}}
     <time class="card-time" datetime="{{.Timestamp}}">{{.Relative}}</time>
@@ -58,7 +59,7 @@
         </div>
       </form>
     </div>
-    <p class="detail-stamp"><code class="task-id">{{.ID}}</code><time datetime="{{.Timestamp}}">updated {{.Relative}}</time><span>Double-click title or description to edit</span></p>
+    <p class="detail-stamp"><code class="task-id">{{.ID}}</code><span>updated {{.Relative}} · <time datetime="{{.Timestamp}}" data-local-time>{{.Timestamp}}</time></span><span>Double-click title or description to edit</span></p>
   </header>
 
   <form class="detail-moves" method="post" action="/tasks/{{.ID}}/move">
@@ -74,41 +75,59 @@
     {{else}}<p class="wait-state">Nothing is holding this back. It is yours to do now.</p>{{end}}
     {{if .StaleWait}}<p class="wait-stale">Pushed out {{.SnoozeCount}} times. Escalate it, go ahead without them, or drop it.</p>{{end}}
 
-    <form class="wait-who-form" method="post" action="/tasks/{{.ID}}/edit">
+    <form class="wait-form" method="post" action="/tasks/{{.ID}}/edit">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <input type="hidden" name="field" value="waiting_on">
+      <input type="hidden" name="field" value="wait">
       <input type="hidden" name="expected_version" value="{{.Version}}">
       <label class="field-label" for="waiting-on-{{.ID}}">Waiting on <span>who or what</span></label>
-      <div class="inline-actions">
-        <input id="waiting-on-{{.ID}}" name="value" value="{{.WaitingOn}}" autocomplete="off" placeholder="Priya, Tom &amp; Rae (asked Mar 4)">
-        <button class="small" type="submit">Save</button>
-      </div>
-    </form>
-
-    <form class="wait-date-form" method="post" action="/tasks/{{.ID}}/edit">
-      <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <input type="hidden" name="field" value="wake_at">
-      <input type="hidden" name="expected_version" value="{{.Version}}">
+      <input id="waiting-on-{{.ID}}" name="waiting_on" value="{{.WaitingOn}}" autocomplete="off" placeholder="the reviewer (asked Jul 24)">
       <label class="field-label" for="wake-at-{{.ID}}">Check back on</label>
-      <div class="inline-actions">
-        <input id="wake-at-{{.ID}}" type="date" name="value" value="{{.WakeInput}}">
-        <button class="small" type="submit">Save</button>
-      </div>
+      <input id="wake-at-{{.ID}}" type="date" name="wake_at" value="{{.WakeInput}}">
+      <label class="field-label" for="on-timeout-{{.ID}}">If still waiting then <span>optional default</span></label>
+      <input id="on-timeout-{{.ID}}" name="on_timeout" value="{{.OnTimeout}}" autocomplete="off" placeholder="send one reminder, then proceed">
       <div class="wait-quick">
         <span class="field-label">or in</span>
         <button class="ghost small" type="submit" name="days" value="1">1 day</button>
         <button class="ghost small" type="submit" name="days" value="3">3 days</button>
         <button class="ghost small" type="submit" name="days" value="7">a week</button>
+        <button class="small" type="submit">Save complete wait</button>
       </div>
     </form>
 
     {{if .WakeLabel}}<form class="wait-clear-form" method="post" action="/tasks/{{.ID}}/edit">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <input type="hidden" name="field" value="wake_at">
+      <input type="hidden" name="field" value="wait">
       <input type="hidden" name="expected_version" value="{{.Version}}">
-      <input type="hidden" name="value" value="">
+      <input type="hidden" name="wake_at" value="">
+      <input type="hidden" name="waiting_on" value="">
+      <input type="hidden" name="on_timeout" value="">
       <button class="ghost small" type="submit">End the wait — put it back on the board</button>
     </form>{{end}}
+  </section>
+
+  <section class="context-editor">
+    <h3>Execution context</h3>
+    <form method="post" action="/tasks/{{.ID}}/edit">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="field" value="context">
+      <input type="hidden" name="expected_version" value="{{.Version}}">
+      <label class="field-label" for="context-{{.ID}}">Available where</label>
+      <div class="inline-actions">
+        <input id="context-{{.ID}}" name="value" value="{{.Context}}" autocomplete="off" placeholder="home, office, online">
+        <button class="small" type="submit">Save</button>
+      </div>
+    </form>
+    <div class="context-check">
+      {{if .ContextCheckedTimestamp}}<p>Context checked {{.ContextCheckedRelative}} · <time datetime="{{.ContextCheckedTimestamp}}" data-local-time>{{.ContextCheckedTimestamp}}</time></p>
+      {{else}}<p>Context has not been checked yet.</p>{{end}}
+      <form method="post" action="/tasks/{{.ID}}/edit">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <input type="hidden" name="field" value="context_checked_at">
+        <input type="hidden" name="expected_version" value="{{.Version}}">
+        <button class="ghost small" type="submit" name="value" value="now">Mark checked now</button>
+        {{if .ContextCheckedTimestamp}}<button class="quiet small" type="submit" name="value" value="">Clear</button>{{end}}
+      </form>
+    </div>
   </section>
 
   <div class="editable-field editable-description" data-edit-field="description">
