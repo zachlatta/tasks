@@ -234,6 +234,32 @@ func TestTaskDescriptionsRenderSafeMarkdown(t *testing.T) {
 	}
 }
 
+func TestAgentSessionLinkAppearsOnKanbanCardAndTaskDetail(t *testing.T) {
+	t.Parallel()
+
+	handler, service := testHandlerWithIDs(t, "linked-task")
+	const sessionURL = "cmux://workspace/00000000-0000-4000-8000-000000000001"
+	created, err := service.Create(context.Background(), task.CreateInput{
+		Title:           "Review completed agent work",
+		AgentSessionURL: sessionURL,
+	})
+	if err != nil {
+		t.Fatalf("create linked task: %v", err)
+	}
+	cookie, _ := login(t, handler)
+
+	for name, body := range map[string]string{
+		"board":  get(t, handler, "/", cookie).Body.String(),
+		"detail": get(t, handler, "/"+created.ID, cookie).Body.String(),
+	} {
+		if !strings.Contains(body, `agent-session-link`) ||
+			!strings.Contains(body, `href="`+sessionURL+`"`) ||
+			!strings.Contains(body, "Open agent session") {
+			t.Errorf("%s does not link to the Cmux agent session; body: %s", name, body)
+		}
+	}
+}
+
 func TestTaskTitlesRenderInlineMarkdown(t *testing.T) {
 	t.Parallel()
 
@@ -614,11 +640,21 @@ func TestEditTaskTitleAndDescription(t *testing.T) {
 		!strings.Contains(descriptionResult.Detail, `name="expected_version" value="3"`) {
 		t.Fatalf("description edit did not return refreshed markup: %#v", descriptionResult)
 	}
+	const sessionURL = "cmux://workspace/00000000-0000-4000-8000-000000000001"
+	sessionResult := edit("agent_session_url", sessionURL, "3")
+	if !strings.Contains(sessionResult.Card, `href="`+sessionURL+`"`) ||
+		!strings.Contains(sessionResult.Detail, `href="`+sessionURL+`"`) ||
+		!strings.Contains(sessionResult.Detail, `name="expected_version" value="4"`) {
+		t.Fatalf("agent-session edit did not return refreshed markup: %#v", sessionResult)
+	}
 	edited, err := service.Get(context.Background(), "edit-me")
 	if err != nil {
 		t.Fatalf("get edited task: %v", err)
 	}
-	if edited.Title != "Revised title" || edited.Description != "Revised **description**." || edited.Version != 3 {
+	if edited.Title != "Revised title" ||
+		edited.Description != "Revised **description**." ||
+		edited.AgentSessionURL != sessionURL ||
+		edited.Version != 4 {
 		t.Fatalf("edited task = %#v", edited)
 	}
 }
@@ -711,9 +747,10 @@ func TestCreateMoveAndUploadFile(t *testing.T) {
 	cookie, csrf := login(t, handler)
 
 	create := postForm(handler, "/tasks", url.Values{
-		"csrf":        {csrf},
-		"title":       {"Ship the web UI"},
-		"description": {"Exercise shared backend behavior."},
+		"csrf":              {csrf},
+		"title":             {"Ship the web UI"},
+		"description":       {"Exercise shared backend behavior."},
+		"agent_session_url": {"cmux://workspace/00000000-0000-4000-8000-000000000001"},
 	}, cookie)
 	if create.Code != http.StatusSeeOther {
 		t.Fatalf("create status = %d; body: %s", create.Code, create.Body.String())
@@ -723,6 +760,9 @@ func TestCreateMoveAndUploadFile(t *testing.T) {
 		t.Fatalf("List = %#v, %v", items, err)
 	}
 	created := items[0]
+	if created.AgentSessionURL != "cmux://workspace/00000000-0000-4000-8000-000000000001" {
+		t.Fatalf("created agent session URL = %q", created.AgentSessionURL)
+	}
 
 	start := postForm(handler, "/tasks/"+created.ID+"/move", url.Values{
 		"csrf": {csrf}, "status": {string(task.StatusInProgress)},

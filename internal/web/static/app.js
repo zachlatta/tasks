@@ -301,6 +301,10 @@
 
   if (board) {
     board.addEventListener('dragstart', (event) => {
+      if (event.target.closest('.agent-session-link')) {
+        event.preventDefault();
+        return;
+      }
       const card = event.target.closest('.task-card');
       if (!card) return;
       dragged = card;
@@ -455,6 +459,7 @@
     board.addEventListener('click', (event) => {
       if (event.defaultPrevented || event.button !== 0) return;
       if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      if (event.target.closest('.agent-session-link')) return;
       const card = event.target.closest('.task-card');
       if (!card || event.target.closest('form, details, button')) return;
       event.preventDefault();

@@ -443,11 +443,12 @@ func TestStoreRoundTripLoadsChildren(t *testing.T) {
 		}
 	}
 	want := task.Task{
-		ID:           "ship-feature",
-		Title:        "Ship feature",
-		Description:  "Release it",
-		Status:       task.StatusTodo,
-		Dependencies: []string{"write-tests", "write-docs"},
+		ID:              "ship-feature",
+		Title:           "Ship feature",
+		Description:     "Release it",
+		AgentSessionURL: "cmux://workspace/00000000-0000-4000-8000-000000000001",
+		Status:          task.StatusTodo,
+		Dependencies:    []string{"write-tests", "write-docs"},
 		Attachments: []task.Attachment{
 			{Key: "ship-feature/a.png", Name: "a.png", ContentType: "image/png"},
 			{Key: "ship-feature/b.png", Name: "b.png", ContentType: "image/png"},
@@ -463,7 +464,10 @@ func TestStoreRoundTripLoadsChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Title != want.Title || got.Description != want.Description || got.Status != want.Status {
+	if got.Title != want.Title ||
+		got.Description != want.Description ||
+		got.AgentSessionURL != want.AgentSessionURL ||
+		got.Status != want.Status {
 		t.Fatalf("scalar fields = %#v", got)
 	}
 	if !got.CreatedAt.Equal(now) || !got.UpdatedAt.Equal(now) {
@@ -1335,6 +1339,7 @@ func TestOpenAddsWaitColumnsToAnExistingDatabase(t *testing.T) {
 		loaded.OnTimeout != "" ||
 		loaded.Context != "" ||
 		loaded.ContextCheckedAt != nil ||
+		loaded.AgentSessionURL != "" ||
 		loaded.SnoozeCount != 0 {
 		t.Fatalf("migrated task should be awake, got %#v", loaded)
 	}

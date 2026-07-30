@@ -35,8 +35,8 @@ The server creates the schema (`tasks`, `dependencies`, `images`, and the `task_
 ## CLI
 
 ```text
-tasks add [--description text] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] <title>
-tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] [--expected-version n] <task-id>
+tasks add [--description text] [--agent-session-url url] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] <title>
+tasks edit [--title text] [--description text | --description-file path|-] [--agent-session-url url] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] [--expected-version n] <task-id>
 tasks query <read-only-sql>
 tasks done <task-id>
 tasks delete <task-id>
@@ -53,9 +53,12 @@ The CLI has no `list` or `show` shortcut. Every user-facing read goes through re
 
 `--context` is a normalized, lightweight tag such as `home`, `office`, or `online`; it never stores coordinates. `--context-checked-at` takes an RFC 3339 timestamp and records when the task's supporting information was explicitly verified. It is independent of `updated_at`.
 
+`--agent-session-url` links a task to the Cmux workspace where an agent is doing or did the work. Only an exact `cmux://workspace/<uuid>` navigation link is accepted; an empty value on `tasks edit` clears it. The kanban card and task detail both render it as **Open agent session**.
+
 ```sh
 tasks edit --title "Research primary sources" <task-id>
 tasks edit --description-file notes.md --expected-version 3 <task-id>
+tasks edit --agent-session-url "cmux://workspace/00000000-0000-0000-0000-000000000001" <task-id>
 cat notes.md | tasks edit --description-file - <task-id>
 tasks edit --depends-on prerequisite-id,other-id <task-id>
 ```
@@ -84,7 +87,7 @@ Successful responses use `{"data": ...}`. Errors use `{"error":{"code":"...","me
 The homepage is a three-column board of **To do**, **In progress**, and **Done**.
 
 - Drag a card to another column to change its status, or within a column to set its order by hand. Both are saved immediately, and a card dropped into **Done** ahead of its dependencies snaps back with the reason.
-- Cards are previews: title, a plain-text slice of the description, dependency and file counts, and a cover thumbnail of the first image. Click one for the full task in a slide-over panel; the URL follows, so the panel is shareable and the back button closes it.
+- Cards are previews: title, a plain-text slice of the description, dependency and file counts, an **Open agent session** link when the task has one, and a cover thumbnail of the first image. Click the title or card body for the full task in a slide-over panel; the URL follows, so the panel is shareable and the back button closes it.
 - In task detail, double-click the title or description to edit it in place. Press `Enter` to save a title, `⌘`/`Ctrl` + `Enter` to save a description, or `Escape` to cancel.
 - **Delete task** at the bottom of the detail takes a card off the board without a confirmation prompt, because it is reversible: the toast that follows offers an undo, and the board's `n deleted` link opens `/deleted`, where every deleted task can be read and restored to exactly where it was.
 - Every drag has a pointer-free equivalent. The `⋯` menu on each card moves it between columns, and focusing a card and holding `⌘`/`Ctrl` with the arrow keys moves it left, right, up, or down.
@@ -138,7 +141,7 @@ The MCP endpoint is `https://your-host.example/mcp`. It implements Streamable HT
 Available tools:
 
 - `query_tasks_sql`: arbitrary read-only PostgreSQL `SELECT`, `WITH`, or `EXPLAIN` queries, capped at 500 rows, including task revision history;
-- `create_task`: create a todo, optionally with dependencies, a complete wait, and execution-context metadata;
+- `create_task`: create a todo, optionally with dependencies, a complete wait, execution-context metadata, and a Cmux agent-session link;
 - `edit_task_text`: atomically apply one or more exact `old_text`/`new_text` replacements to a task title or description;
 - `update_task`: replace any supplied title, description, complete dependency list, wait, or execution-context metadata;
 - `complete_task`: mark a task done once its dependencies are done;
@@ -147,7 +150,7 @@ Available tools:
 
 `delete_task` never removes data. It stamps `tasks.deleted_at`, which takes the task off the board and out of `task_overview`, the domain list, and every other operation; `restore_task` clears the stamp and the task comes back with its status, board position, text, dependencies, and files intact. Two guardrails keep live dependencies resolvable: a task other live tasks depend on cannot be deleted, and a task whose own dependencies are still deleted cannot be restored until they are. Both tools are idempotent.
 
-`edit_task_text` is intended for agent-authored contextual edits. Replacements run in order in one transaction. By default each `old_text` must occur exactly once; missing or ambiguous text fails the whole call, while `replace_all: true` explicitly replaces every occurrence. `update_task` is the whole-field equivalent: omitted fields remain unchanged, while supplied empty values clear their fields. Named waits must retain a wake date or dependency review trigger. Both tools accept an optional `expected_version` from a prior query so a stale agent cannot overwrite a newer task. Dependency edits reject missing tasks and cycles.
+`edit_task_text` is intended for agent-authored contextual edits. Replacements run in order in one transaction. By default each `old_text` must occur exactly once; missing or ambiguous text fails the whole call, while `replace_all: true` explicitly replaces every occurrence. `update_task` is the whole-field equivalent: omitted fields remain unchanged, while supplied empty values clear their fields. Its `agent_session_url` accepts only an exact `cmux://workspace/<uuid>` link, which opens the native Cmux workspace from the kanban card. Named waits must retain a wake date or dependency review trigger. Both tools accept an optional `expected_version` from a prior query so a stale agent cannot overwrite a newer task. Dependency edits reject missing tasks and cycles.
 
 There is deliberately no MCP `list_tasks` tool. Trusted agents can inspect the schema with:
 
@@ -160,7 +163,7 @@ ORDER BY table_name, ordinal_position;
 
 Each read runs inside a PostgreSQL `READ ONLY` transaction; the HTTP API and MCP layers also reject statements that do not begin with `SELECT`, `WITH`, or `EXPLAIN`. The intentionally small schema is:
 
-- `tasks(id, title, description, status, position, wake_at, waiting_on, on_timeout, snooze_count, context, context_checked_at, created_at, updated_at, version, deleted_at)`, where status is `todo`, `in_progress`, or `done`, `position` orders a column top to bottom, `context` is a tag rather than precise location data, and a non-null `deleted_at` marks a soft-deleted task
+- `tasks(id, title, description, agent_session_url, status, position, wake_at, waiting_on, on_timeout, snooze_count, context, context_checked_at, created_at, updated_at, version, deleted_at)`, where `agent_session_url` is an optional exact Cmux workspace deep link, status is `todo`, `in_progress`, or `done`, `position` orders a column top to bottom, `context` is a tag rather than precise location data, and a non-null `deleted_at` marks a soft-deleted task
 - `dependencies(task_id, depends_on_id)`
 - `images(task_id, object_key, name, content_type)`
 - `task_revisions(revision_id, task_id, version, action, actor_kind, actor_id, source, request_id, occurred_at, before_state, after_state, metadata)`

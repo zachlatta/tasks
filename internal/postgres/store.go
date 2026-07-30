@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 	id TEXT PRIMARY KEY,
 	title TEXT NOT NULL,
 	description TEXT NOT NULL,
+	agent_session_url TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL,
 	updated_at TIMESTAMPTZ NOT NULL,
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS position DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS agent_session_url TEXT NOT NULL DEFAULT '';
 -- Soft delete: a deleted task keeps its row and its whole revision history, and
 -- a NULL deleted_at marks a task that is still on the board.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
@@ -145,6 +147,7 @@ SELECT
 	t.id,
 	t.title,
 	t.description,
+	t.agent_session_url,
 	t.status,
 	t.created_at,
 	t.updated_at,
@@ -254,7 +257,7 @@ func (s *Store) SetMaxRows(maximum int) {
 
 // taskColumns is the stored task projection every read shares, in the order
 // scanTask expects.
-const taskColumns = `id, title, description, status, position, wake_at, waiting_on, on_timeout, snooze_count, context, context_checked_at, created_at, updated_at, version, deleted_at`
+const taskColumns = `id, title, description, agent_session_url, status, position, wake_at, waiting_on, on_timeout, snooze_count, context, context_checked_at, created_at, updated_at, version, deleted_at`
 
 // Create inserts a new task and its dependencies and images atomically.
 func (s *Store) Create(ctx context.Context, item task.Task) error {
@@ -267,11 +270,11 @@ func (s *Store) Create(ctx context.Context, item task.Task) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO tasks (
-				id, title, description, status, position, wake_at, waiting_on, on_timeout,
+				id, title, description, agent_session_url, status, position, wake_at, waiting_on, on_timeout,
 				snooze_count, context, context_checked_at, created_at, updated_at, version, deleted_at
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-		`, item.ID, item.Title, item.Description, string(item.Status), item.Position,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		`, item.ID, item.Title, item.Description, item.AgentSessionURL, string(item.Status), item.Position,
 			item.WakeAt, item.WaitingOn, item.OnTimeout, item.SnoozeCount,
 			item.Context, item.ContextCheckedAt,
 			item.CreatedAt, item.UpdatedAt, item.Version, item.DeletedAt)
@@ -302,12 +305,12 @@ func (s *Store) Update(ctx context.Context, item task.Task) error {
 		}
 		tag, err := tx.Exec(ctx, `
 			UPDATE tasks
-			SET title = $2, description = $3, status = $4, position = $5,
-				wake_at = $6, waiting_on = $7, on_timeout = $8, snooze_count = $9,
-				context = $10, context_checked_at = $11,
-				updated_at = $12, version = $13, deleted_at = $14
-			WHERE id = $1 AND version = $15
-		`, item.ID, item.Title, item.Description, string(item.Status), item.Position,
+			SET title = $2, description = $3, agent_session_url = $4, status = $5, position = $6,
+				wake_at = $7, waiting_on = $8, on_timeout = $9, snooze_count = $10,
+				context = $11, context_checked_at = $12,
+				updated_at = $13, version = $14, deleted_at = $15
+			WHERE id = $1 AND version = $16
+		`, item.ID, item.Title, item.Description, item.AgentSessionURL, string(item.Status), item.Position,
 			item.WakeAt, item.WaitingOn, item.OnTimeout, item.SnoozeCount,
 			item.Context, item.ContextCheckedAt,
 			item.UpdatedAt, item.Version, item.DeletedAt, before.Version)
@@ -650,7 +653,7 @@ func scanTask(row pgx.Row) (task.Task, error) {
 	var item task.Task
 	var status string
 	err := row.Scan(
-		&item.ID, &item.Title, &item.Description, &status, &item.Position,
+		&item.ID, &item.Title, &item.Description, &item.AgentSessionURL, &status, &item.Position,
 		&item.WakeAt, &item.WaitingOn, &item.OnTimeout, &item.SnoozeCount,
 		&item.Context, &item.ContextCheckedAt,
 		&item.CreatedAt, &item.UpdatedAt, &item.Version, &item.DeletedAt,

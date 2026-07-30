@@ -68,6 +68,7 @@ const (
 	fieldWait             = "wait"
 	fieldContext          = "context"
 	fieldContextCheckedAt = "context_checked_at"
+	fieldAgentSessionURL  = "agent_session_url"
 )
 
 //go:embed templates/*.html static/*.css static/*.js
@@ -185,6 +186,10 @@ type taskCard struct {
 	DeletedTimestamp        string
 	ContextCheckedRelative  string
 	ContextCheckedTimestamp string
+	// AgentSessionHref has already passed task.IsValidAgentSessionURL. Keeping
+	// the trusted URL separate from the stored string lets html/template emit
+	// the custom cmux scheme without treating arbitrary task data as a URL.
+	AgentSessionHref template.URL
 }
 
 // dependencyView names a prerequisite so a card can show what is holding it up
@@ -475,10 +480,11 @@ func (h *handler) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	created, err := h.tasks.Create(webMutationContext(r.Context()), task.CreateInput{
-		Title:        r.PostForm.Get("title"),
-		Description:  r.PostForm.Get("description"),
-		Dependencies: strings.Split(r.PostForm.Get("dependencies"), ","),
-		Context:      r.PostForm.Get("context"),
+		Title:           r.PostForm.Get("title"),
+		Description:     r.PostForm.Get("description"),
+		AgentSessionURL: r.PostForm.Get("agent_session_url"),
+		Dependencies:    strings.Split(r.PostForm.Get("dependencies"), ","),
+		Context:         r.PostForm.Get("context"),
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -553,8 +559,14 @@ func (h *handler) editTask(w http.ResponseWriter, r *http.Request) {
 			message = "Updated context check time"
 		}
 		input.ContextCheckedAt = checkedAt
+	case fieldAgentSessionURL:
+		input.AgentSessionURL = &value
+		message = "Linked agent session"
+		if value == "" {
+			message = "Cleared agent session"
+		}
 	default:
-		h.mutationFailed(w, r, http.StatusBadRequest, "field must be title, description, wait, context, or context_checked_at")
+		h.mutationFailed(w, r, http.StatusBadRequest, "field must be title, description, wait, context, context_checked_at, or agent_session_url")
 		return
 	}
 
@@ -786,6 +798,9 @@ func (h *handler) newTaskCard(item task.Task, csrf string, lookup func(string) (
 		Excerpt:     excerpt(item.Description),
 		Relative:    h.relativeTime(item.UpdatedAt),
 		Timestamp:   item.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	if task.IsValidAgentSessionURL(item.AgentSessionURL) {
+		card.AgentSessionHref = template.URL(item.AgentSessionURL)
 	}
 	if item.ContextCheckedAt != nil {
 		card.ContextCheckedRelative = h.relativeTime(*item.ContextCheckedAt)

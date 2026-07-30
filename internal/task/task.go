@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -35,13 +36,14 @@ type Attachment struct {
 }
 
 type Task struct {
-	ID           string       `json:"id" yaml:"id"`
-	Title        string       `json:"title" yaml:"title"`
-	Description  string       `json:"description" yaml:"-"`
-	Status       Status       `json:"status" yaml:"status"`
-	Position     float64      `json:"position" yaml:"position"`
-	Dependencies []string     `json:"dependencies,omitempty" yaml:"dependencies,omitempty"`
-	Attachments  []Attachment `json:"attachments,omitempty" yaml:"attachments,omitempty"`
+	ID              string       `json:"id" yaml:"id"`
+	Title           string       `json:"title" yaml:"title"`
+	Description     string       `json:"description" yaml:"-"`
+	AgentSessionURL string       `json:"agent_session_url,omitempty" yaml:"agent_session_url,omitempty"`
+	Status          Status       `json:"status" yaml:"status"`
+	Position        float64      `json:"position" yaml:"position"`
+	Dependencies    []string     `json:"dependencies,omitempty" yaml:"dependencies,omitempty"`
+	Attachments     []Attachment `json:"attachments,omitempty" yaml:"attachments,omitempty"`
 	// WakeAt holds a task back from the board until the date arrives. It is the
 	// half of a wake condition a clock can settle; unfinished dependencies are
 	// the other half, and callers combine both.
@@ -93,6 +95,29 @@ func (t Task) StaleWait() bool {
 // staleSnoozeCount is how many pushes turn a wait into a prompt to escalate,
 // proceed without the other party, or drop the thread.
 const staleSnoozeCount = 3
+
+var cmuxWorkspaceURL = regexp.MustCompile(
+	`^cmux://workspace/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$`,
+)
+
+// validateAgentSessionURL limits native-app links to Cmux's inert workspace
+// navigation route. In particular it rejects prompt, SSH, query, and fragment
+// links so task content cannot turn an "open session" button into an action.
+func validateAgentSessionURL(value string) error {
+	if value == "" || IsValidAgentSessionURL(value) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: agent_session_url must be an exact cmux://workspace/<uuid> link",
+		ErrInvalid,
+	)
+}
+
+// IsValidAgentSessionURL reports whether value is the one native navigation
+// route Tasks is allowed to render as a clickable link.
+func IsValidAgentSessionURL(value string) bool {
+	return cmuxWorkspaceURL.MatchString(value)
+}
 
 // WakeAtLayouts are the wake-date spellings every interface accepts. A bare
 // date means midnight UTC, so a task set to wake on a day is back on the board
@@ -150,9 +175,10 @@ type Repository interface {
 }
 
 type CreateInput struct {
-	Title        string   `json:"title"`
-	Description  string   `json:"description,omitempty"`
-	Dependencies []string `json:"dependencies,omitempty"`
+	Title           string   `json:"title"`
+	Description     string   `json:"description,omitempty"`
+	AgentSessionURL string   `json:"agent_session_url,omitempty"`
+	Dependencies    []string `json:"dependencies,omitempty"`
 	// WakeAt starts the task asleep until the date arrives, for work that is
 	// captured already waiting on someone.
 	WakeAt *time.Time `json:"wake_at,omitempty"`
@@ -186,9 +212,10 @@ type TextReplacement struct {
 // omitted field from a request to clear it. Replacements run in order after
 // any whole-field values have been applied.
 type EditInput struct {
-	Title        *string
-	Description  *string
-	Dependencies *[]string
+	Title           *string
+	Description     *string
+	AgentSessionURL *string
+	Dependencies    *[]string
 	// WakeAt supplies a new wake date when non-nil. A zero time clears the
 	// date and returns the task to the board, mirroring how an empty
 	// description or dependency list clears those fields.
@@ -249,6 +276,9 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Task, error) {
 	if input.Title == "" {
 		return Task{}, fmt.Errorf("%w: title is required", ErrInvalid)
 	}
+	if err := validateAgentSessionURL(input.AgentSessionURL); err != nil {
+		return Task{}, err
+	}
 	dependencies := uniqueNonEmpty(input.Dependencies)
 	for _, dependency := range dependencies {
 		if _, err := s.live(ctx, dependency); err != nil {
@@ -269,17 +299,18 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Task, error) {
 		return Task{}, err
 	}
 	created := Task{
-		Title:        input.Title,
-		Description:  input.Description,
-		Status:       StatusTodo,
-		Position:     position,
-		Dependencies: dependencies,
-		WaitingOn:    strings.TrimSpace(input.WaitingOn),
-		OnTimeout:    strings.TrimSpace(input.OnTimeout),
-		Context:      contextName,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		Version:      1,
+		Title:           input.Title,
+		Description:     input.Description,
+		AgentSessionURL: input.AgentSessionURL,
+		Status:          StatusTodo,
+		Position:        position,
+		Dependencies:    dependencies,
+		WaitingOn:       strings.TrimSpace(input.WaitingOn),
+		OnTimeout:       strings.TrimSpace(input.OnTimeout),
+		Context:         contextName,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		Version:         1,
 	}
 	if input.WakeAt != nil && !input.WakeAt.IsZero() {
 		wake := input.WakeAt.UTC()
@@ -397,6 +428,7 @@ func (s *Service) Move(ctx context.Context, id string, status Status, index int)
 func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, error) {
 	if input.Title == nil &&
 		input.Description == nil &&
+		input.AgentSessionURL == nil &&
 		input.Dependencies == nil &&
 		input.WakeAt == nil &&
 		input.WaitingOn == nil &&
@@ -427,6 +459,12 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 	}
 	if input.Description != nil {
 		edited.Description = *input.Description
+	}
+	if input.AgentSessionURL != nil {
+		if err := validateAgentSessionURL(*input.AgentSessionURL); err != nil {
+			return Task{}, err
+		}
+		edited.AgentSessionURL = *input.AgentSessionURL
 	}
 	if input.Dependencies != nil {
 		edited.Dependencies = uniqueNonEmpty(*input.Dependencies)
@@ -482,6 +520,7 @@ func (s *Service) Edit(ctx context.Context, id string, input EditInput) (Task, e
 	}
 	if edited.Title == current.Title &&
 		edited.Description == current.Description &&
+		edited.AgentSessionURL == current.AgentSessionURL &&
 		slices.Equal(edited.Dependencies, current.Dependencies) &&
 		sameInstant(edited.WakeAt, current.WakeAt) &&
 		edited.WaitingOn == current.WaitingOn &&

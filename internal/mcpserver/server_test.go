@@ -75,11 +75,13 @@ func TestToolsUpdateAndEditTaskTextWithoutPostgres(t *testing.T) {
 
 	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "create_task", Arguments: map[string]any{
 		"title": "Research", "description": "source and source",
+		"agent_session_url": "cmux://workspace/00000000-0000-4000-8000-000000000001",
 	}}); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
 	updated, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "update_task", Arguments: map[string]any{
 		"id": "editable", "expected_version": 1, "title": "Research sources",
+		"agent_session_url": "cmux://workspace/00000000-0000-4000-8000-000000000002",
 	}})
 	if err != nil || updated.IsError {
 		t.Fatalf("update task = %#v, %v", updated, err)
@@ -97,7 +99,10 @@ func TestToolsUpdateAndEditTaskTextWithoutPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get edited task: %v", err)
 	}
-	if item.Title != "Research sources" || item.Description != "primary source and primary source" || item.Version != 3 {
+	if item.Title != "Research sources" ||
+		item.Description != "primary source and primary source" ||
+		item.AgentSessionURL != "cmux://workspace/00000000-0000-4000-8000-000000000002" ||
+		item.Version != 3 {
 		t.Fatalf("edited task = %#v", item)
 	}
 

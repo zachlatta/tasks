@@ -26,6 +26,7 @@
     {{with .WaitingOn}}<span class="wait-who">{{.}}</span>{{end}}
   </p>{{end}}
   <div class="card-meta">
+    {{with .AgentSessionHref}}<a class="agent-session-link chip" href="{{.}}" draggable="false">Open agent session</a>{{end}}
     <code class="task-id">{{.ID}}</code>
     {{if and .Blocked (not .Sleeping)}}<span class="chip chip-blocked">Blocked</span>{{end}}
     {{with .Context}}<span class="chip chip-context">@{{.}}</span>{{end}}
@@ -67,6 +68,21 @@
     <span class="field-label">Move to</span>
     {{range .Moves}}<button class="ghost" type="submit" name="status" value="{{.Status}}">{{.Label}}</button>{{end}}
   </form>
+
+  <section class="agent-session-editor">
+    <h3>Agent session</h3>
+    {{with .AgentSessionHref}}<p><a class="agent-session-link" href="{{.}}">Open agent session in Cmux</a></p>{{end}}
+    <form class="inline-edit" method="post" action="/tasks/{{.ID}}/edit">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="field" value="agent_session_url">
+      <input type="hidden" name="expected_version" value="{{.Version}}">
+      <label class="field-label" for="agent-session-url-{{.ID}}">Cmux workspace link <span>from <code>cm link</code></span></label>
+      <div class="inline-actions">
+        <input id="agent-session-url-{{.ID}}" name="value" value="{{.AgentSessionURL}}" autocomplete="off" placeholder="cmux://workspace/…">
+        <button class="small" type="submit">Save</button>
+      </div>
+    </form>
+  </section>
 
   <section class="wait-editor{{if .Sleeping}} is-waiting{{end}}">
     <h3>Waiting</h3>

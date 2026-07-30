@@ -81,6 +81,68 @@ func TestStartTaskMovesItIntoProgress(t *testing.T) {
 	}
 }
 
+func TestAgentSessionURLCanBeCreatedUpdatedAndCleared(t *testing.T) {
+	t.Parallel()
+
+	repo := newMemoryRepository()
+	now := time.Date(2026, time.July, 29, 12, 0, 0, 0, time.UTC)
+	service := NewService(repo, func() time.Time { return now }, func() string { return "linked" })
+	firstURL := "cmux://workspace/00000000-0000-4000-8000-000000000001"
+	created, err := service.Create(context.Background(), CreateInput{
+		Title:           "Review the agent's work",
+		AgentSessionURL: firstURL,
+	})
+	if err != nil {
+		t.Fatalf("Create with agent session URL: %v", err)
+	}
+	if created.AgentSessionURL != firstURL {
+		t.Fatalf("created agent session URL = %q, want %q", created.AgentSessionURL, firstURL)
+	}
+
+	secondURL := "cmux://workspace/00000000-0000-4000-8000-000000000002"
+	now = now.Add(time.Hour)
+	updated, err := service.Edit(context.Background(), created.ID, EditInput{AgentSessionURL: &secondURL})
+	if err != nil {
+		t.Fatalf("Edit agent session URL: %v", err)
+	}
+	if updated.AgentSessionURL != secondURL || updated.Version != 2 {
+		t.Fatalf("updated task = %#v", updated)
+	}
+
+	empty := ""
+	cleared, err := service.Edit(context.Background(), created.ID, EditInput{AgentSessionURL: &empty})
+	if err != nil {
+		t.Fatalf("Clear agent session URL: %v", err)
+	}
+	if cleared.AgentSessionURL != "" || cleared.Version != 3 {
+		t.Fatalf("cleared task = %#v", cleared)
+	}
+}
+
+func TestAgentSessionURLRejectsAnythingExceptAnExactCmuxWorkspaceLink(t *testing.T) {
+	t.Parallel()
+
+	for _, invalid := range []string{
+		"https://example.com",
+		"cmux://ssh?host=example.com",
+		"cmux://prompt?text=run%20something",
+		"cmux://workspace/not-a-uuid",
+		"cmux://workspace/00000000-0000-4000-8000-000000000001?command=id",
+		"cmux://workspace/00000000-0000-4000-8000-000000000001#pane",
+		" cmux://workspace/00000000-0000-4000-8000-000000000001 ",
+	} {
+		t.Run(invalid, func(t *testing.T) {
+			repo := newMemoryRepository()
+			service := NewService(repo, time.Now, func() string { return "invalid" })
+			if _, err := service.Create(context.Background(), CreateInput{
+				Title: "Unsafe link", AgentSessionURL: invalid,
+			}); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("Create error = %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
 func TestListOrdersTasksByWorkflowStateThenNewest(t *testing.T) {
 	t.Parallel()
 

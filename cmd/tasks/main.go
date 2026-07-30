@@ -83,6 +83,7 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		flags := flag.NewFlagSet("add", flag.ContinueOnError)
 		flags.SetOutput(stderr)
 		description := flags.String("description", "", "Markdown description")
+		agentSessionURL := flags.String("agent-session-url", "", "cmux://workspace/<uuid> link to the agent session")
 		dependencies := flags.String("depends-on", "", "comma-separated dependency task IDs")
 		wakeAt := flags.String("wake-at", "", "hold the task off the board until this date (YYYY-MM-DD or RFC 3339)")
 		waitingOn := flags.String("waiting-on", "", "one line naming who or what the task is waiting for")
@@ -96,6 +97,7 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		created, err := client.CreateTask(context.Background(), taskapi.CreateTaskInput{
 			Title:            title,
 			Description:      *description,
+			AgentSessionURL:  *agentSessionURL,
 			Dependencies:     strings.Split(*dependencies, ","),
 			WakeAt:           *wakeAt,
 			WaitingOn:        *waitingOn,
@@ -115,6 +117,7 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		var title optionalString
 		var description optionalString
 		var descriptionFile optionalString
+		var agentSessionURL optionalString
 		var dependencies optionalString
 		var wakeAt optionalString
 		var waitingOn optionalString
@@ -125,6 +128,7 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		flags.Var(&title, "title", "complete replacement title")
 		flags.Var(&description, "description", "complete replacement Markdown description")
 		flags.Var(&descriptionFile, "description-file", "read replacement Markdown description from a file, or - for stdin")
+		flags.Var(&agentSessionURL, "agent-session-url", "cmux://workspace/<uuid> link to the agent session; empty clears")
 		flags.Var(&dependencies, "depends-on", "complete replacement comma-separated dependency task IDs; empty clears")
 		flags.Var(&wakeAt, "wake-at", "hold the task off the board until this date (YYYY-MM-DD or RFC 3339); empty wakes it now")
 		flags.Var(&waitingOn, "waiting-on", "one line naming who or what the task is waiting for; empty clears")
@@ -136,7 +140,7 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 			return 2
 		}
 		if len(flags.Args()) != 1 {
-			fmt.Fprintln(stderr, "Usage: tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] [--expected-version n] <task-id>")
+			fmt.Fprintln(stderr, "Usage: tasks edit [--title text] [--description text | --description-file path|-] [--agent-session-url url] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] [--expected-version n] <task-id>")
 			return 2
 		}
 		if description.set && descriptionFile.set {
@@ -146,6 +150,7 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 		if !title.set &&
 			!description.set &&
 			!descriptionFile.set &&
+			!agentSessionURL.set &&
 			!dependencies.set &&
 			!wakeAt.set &&
 			!waitingOn.set &&
@@ -170,6 +175,9 @@ func runClientCommand(args []string, stdin io.Reader, stdout, stderr io.Writer, 
 				return 1
 			}
 			input.Description = &value
+		}
+		if agentSessionURL.set {
+			input.AgentSessionURL = &agentSessionURL.value
 		}
 		if dependencies.set {
 			values := strings.Split(dependencies.value, ",")
@@ -415,8 +423,8 @@ func readTextInput(stdin io.Reader, path string) (string, error) {
 
 func usage(output io.Writer) {
 	fmt.Fprintln(output, `Usage:
-  tasks add [--description text] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] <title>
-  tasks edit [--title text] [--description text | --description-file path|-] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] [--expected-version n] <task-id>
+  tasks add [--description text] [--agent-session-url url] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] <title>
+  tasks edit [--title text] [--description text | --description-file path|-] [--agent-session-url url] [--depends-on id,id] [--wake-at date] [--waiting-on text] [--on-timeout text] [--context name] [--context-checked-at timestamp] [--expected-version n] <task-id>
   tasks query <read-only-sql>
   tasks done <task-id>
   tasks delete <task-id>

@@ -14,6 +14,7 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 	const secret = "test-secret"
 	var title string
 	var description string
+	var agentSessionURL string
 	var version int64
 	var status string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -26,19 +27,21 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/tools/create_task":
 			var input struct {
-				Title       string `json:"title"`
-				Description string `json:"description"`
+				Title           string `json:"title"`
+				Description     string `json:"description"`
+				AgentSessionURL string `json:"agent_session_url"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 				t.Errorf("decode create input: %v", err)
 			}
-			title, description, version, status = input.Title, input.Description, 1, "todo"
+			title, description, agentSessionURL, version, status = input.Title, input.Description, input.AgentSessionURL, 1, "todo"
 			_, _ = io.WriteString(w, `{"data":{"id":"test-task","version":1}}`)
 		case "/api/tools/update_task":
 			var input struct {
 				ID              string  `json:"id"`
 				Title           *string `json:"title"`
 				Description     *string `json:"description"`
+				AgentSessionURL *string `json:"agent_session_url"`
 				ExpectedVersion *int64  `json:"expected_version"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
@@ -47,7 +50,7 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 			if input.ID != "test-task" || input.ExpectedVersion == nil || *input.ExpectedVersion != version {
 				t.Errorf("update input = %#v; current version = %d", input, version)
 			}
-			title, description, version = *input.Title, *input.Description, version+1
+			title, description, agentSessionURL, version = *input.Title, *input.Description, *input.AgentSessionURL, version+1
 			_, _ = io.WriteString(w, `{"data":{"id":"test-task","version":2}}`)
 		case "/api/tools/query_tasks_sql":
 			var input struct {
@@ -64,7 +67,8 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 				return
 			}
 			row, err := json.Marshal(map[string]any{
-				"id": "test-task", "status": status, "title": title, "description": description, "version": version,
+				"id": "test-task", "status": status, "title": title, "description": description,
+				"agent_session_url": agentSessionURL, "version": version,
 			})
 			if err != nil {
 				t.Errorf("encode query row: %v", err)
@@ -86,7 +90,11 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 
 	var output bytes.Buffer
 	var errors bytes.Buffer
-	if code := run([]string{"add", "--description", "Old description", "Test the CLI"}, strings.NewReader(""), &output, &errors); code != 0 {
+	if code := run([]string{
+		"add", "--description", "Old description",
+		"--agent-session-url", "cmux://workspace/00000000-0000-4000-8000-000000000001",
+		"Test the CLI",
+	}, strings.NewReader(""), &output, &errors); code != 0 {
 		t.Fatalf("add exit = %d; stderr: %s", code, errors.String())
 	}
 	fields := strings.Fields(output.String())
@@ -98,7 +106,9 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 	output.Reset()
 	errors.Reset()
 	if code := run([]string{
-		"edit", "--title", "Edited in the CLI", "--description-file", "-", "--expected-version", "1", id,
+		"edit", "--title", "Edited in the CLI", "--description-file", "-",
+		"--agent-session-url", "cmux://workspace/00000000-0000-4000-8000-000000000002",
+		"--expected-version", "1", id,
 	}, strings.NewReader("Uploaded description\n"), &output, &errors); code != 0 {
 		t.Fatalf("edit exit = %d; stderr: %s", code, errors.String())
 	}
@@ -115,6 +125,7 @@ func TestCLIAddQueryAndComplete(t *testing.T) {
 		!strings.Contains(output.String(), "todo") ||
 		!strings.Contains(output.String(), "Edited in the CLI") ||
 		!strings.Contains(output.String(), "Uploaded description\\n") ||
+		!strings.Contains(output.String(), "cmux://workspace/00000000-0000-4000-8000-000000000002") ||
 		!strings.Contains(output.String(), `"version": 2`) {
 		t.Fatalf("query output = %q", output.String())
 	}

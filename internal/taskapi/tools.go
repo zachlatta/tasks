@@ -38,6 +38,7 @@ type SQLQueryOutput struct {
 type CreateTaskInput struct {
 	Title            string   `json:"title" jsonschema:"Short, required title for the task."`
 	Description      string   `json:"description,omitempty" jsonschema:"Optional Markdown task description."`
+	AgentSessionURL  string   `json:"agent_session_url,omitempty" jsonschema:"Optional exact cmux://workspace/<uuid> link to the agent session where the work is happening."`
 	Dependencies     []string `json:"dependencies,omitempty" jsonschema:"IDs of tasks that must be done first."`
 	WakeAt           string   `json:"wake_at,omitempty" jsonschema:"Optional date the task should return to the board, as YYYY-MM-DD (midnight UTC) or an RFC 3339 timestamp. Until then the task is captured but held off the board."`
 	WaitingOn        string   `json:"waiting_on,omitempty" jsonschema:"Optional one-line note naming who or what the task is waiting for. A named wait must also have wake_at or a dependency review trigger."`
@@ -63,6 +64,7 @@ type UpdateTaskInput struct {
 	ExpectedVersion  *int64    `json:"expected_version,omitempty" jsonschema:"Optional version from a prior read. The edit fails instead of overwriting a newer task when it does not match."`
 	Title            *string   `json:"title,omitempty" jsonschema:"Optional complete replacement title. Whitespace is trimmed and the result must not be blank."`
 	Description      *string   `json:"description,omitempty" jsonschema:"Optional complete replacement Markdown description. An empty string clears it."`
+	AgentSessionURL  *string   `json:"agent_session_url,omitempty" jsonschema:"Optional exact cmux://workspace/<uuid> link to the agent session where the work is happening. An empty string clears it."`
 	Dependencies     *[]string `json:"dependencies,omitempty" jsonschema:"Optional complete replacement dependency ID list. An empty list clears all dependencies."`
 	WakeAt           *string   `json:"wake_at,omitempty" jsonschema:"Optional date the task should return to the board, as YYYY-MM-DD (midnight UTC) or an RFC 3339 timestamp. An empty string clears it and wakes the task now."`
 	WaitingOn        *string   `json:"waiting_on,omitempty" jsonschema:"Optional one-line note naming who or what the task is waiting for. An empty string clears it."`
@@ -108,6 +110,7 @@ func (t *Tools) CreateTask(ctx context.Context, input CreateTaskInput) (task.Tas
 	return t.tasks.Create(ctx, task.CreateInput{
 		Title:            input.Title,
 		Description:      input.Description,
+		AgentSessionURL:  input.AgentSessionURL,
 		Dependencies:     input.Dependencies,
 		WakeAt:           wakeAt,
 		WaitingOn:        input.WaitingOn,
@@ -127,6 +130,7 @@ func (t *Tools) UpdateTask(ctx context.Context, input UpdateTaskInput) (task.Tas
 	edit := task.EditInput{
 		Title:           input.Title,
 		Description:     input.Description,
+		AgentSessionURL: input.AgentSessionURL,
 		Dependencies:    input.Dependencies,
 		WaitingOn:       input.WaitingOn,
 		OnTimeout:       input.OnTimeout,
