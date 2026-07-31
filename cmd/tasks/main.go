@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -31,7 +33,38 @@ import (
 var version = "dev"
 
 func main() {
+	buildInfo, ok := debug.ReadBuildInfo()
+	version = resolveVersion(version, buildInfo, ok)
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+// resolveVersion prefers the release version the linker injected and
+// otherwise falls back to the VCS revision Go embedded at build time, so a
+// production container built straight from a checkout still knows what it is
+// running.
+func resolveVersion(linked string, info *debug.BuildInfo, ok bool) string {
+	if linked != "dev" || !ok || info == nil {
+		return linked
+	}
+	revision, modified := "", false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if revision == "" {
+		return linked
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if modified {
+		revision += "-dirty"
+	}
+	return revision
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -301,6 +334,10 @@ func serve(loaded config.Config, service *task.Service, store *postgres.Store, s
 	webHandler := web.New(web.Config{
 		Tasks: service, Reader: store, Objects: objects, Auth: oauthServer, SecureCookies: loaded.SecureCookies(), Sessions: store,
 	})
+	logger := slog.New(slog.NewTextHandler(stdout, nil))
+	if err := store.ReaderRoleError(); err != nil {
+		logger.Warn("agent SQL is not restricted to the task tables; the connecting database user could not set up the tasks_reader role", "error", err)
+	}
 	tools := taskapi.NewTools(service, store)
 	handler, err := app.NewHTTPHandler(
 		webHandler,
@@ -308,6 +345,7 @@ func serve(loaded config.Config, service *task.Service, store *postgres.Store, s
 		mcpserver.NewWithTools(tools, version),
 		taskapi.NewHandler(tools),
 		loaded.PublicURL,
+		logger,
 	)
 	if err != nil {
 		return err

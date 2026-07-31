@@ -18,7 +18,7 @@ func TestHTTPHandlerExposesDiscoveryAndProtectsMCP(t *testing.T) {
 	taskAPI := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	handler, err := NewHTTPHandler(http.NotFoundHandler(), oauth, mcpServer, taskAPI, "https://tasks.example.com")
+	handler, err := NewHTTPHandler(http.NotFoundHandler(), oauth, mcpServer, taskAPI, "https://tasks.example.com", nil)
 	if err != nil {
 		t.Fatalf("NewHTTPHandler: %v", err)
 	}

@@ -37,9 +37,8 @@ func NewWithTools(tools *taskapi.Tools, version string) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:  taskapi.QueryTasksSQLTool,
 		Title: "Query tasks with read-only SQL",
-		Description: "Runs trusted, read-only PostgreSQL queries. Tables: tasks, dependencies, images, task_revisions. " +
-			"View: task_overview, which adds blocked, snoozed, and sleeping flags plus agent-session, wait, and execution-context fields. " +
-			"Results are capped at 500 rows. Inspect the schema via information_schema.columns.",
+		Description: "Runs trusted, read-only PostgreSQL queries (SELECT, WITH, or EXPLAIN; results capped at 500 rows; 5-second statement timeout).\n" +
+			taskapi.SchemaReference(),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &closedWorld},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input SQLQueryInput) (*mcp.CallToolResult, SQLQueryOutput, error) {
 		output, err := tools.QueryTasksSQL(ctx, input)

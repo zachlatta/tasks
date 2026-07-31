@@ -25,6 +25,12 @@ const defaultMaxRows = 500
 type Store struct {
 	pool    *pgxpool.Pool
 	maxRows int
+	// readerRole is the role agent SQL queries run as, restricted to the task
+	// relations. It is empty when the connecting user could not set it up, in
+	// which case readerRoleErr records why and queries fall back to the
+	// connecting user's own privileges.
+	readerRole    string
+	readerRoleErr error
 }
 
 // Result is a read-only query result returned to the CLI and MCP agents.
@@ -172,6 +178,10 @@ SELECT
 	t.snooze_count,
 	t.context,
 	t.context_checked_at,
+	-- The prerequisite IDs themselves, so one read answers "what does this
+	-- task wait on" without joining the dependencies table by hand.
+	(SELECT coalesce(array_agg(d.depends_on_id ORDER BY d.depends_on_id), '{}'::text[])
+	 FROM dependencies d WHERE d.task_id = t.id) AS depends_on,
 	(SELECT count(*) FROM dependencies d WHERE d.task_id = t.id) AS dependency_count,
 	(SELECT count(*) FROM images i WHERE i.task_id = t.id) AS image_count,
 	t.version,
@@ -221,6 +231,36 @@ CREATE INDEX IF NOT EXISTS oauth_refresh_tokens_expires_idx ON oauth_refresh_tok
 CREATE INDEX IF NOT EXISTS web_sessions_expires_idx ON web_sessions(expires_at);
 `
 
+// readerRoleName is the role agent-facing SQL runs as. It can read the task
+// relations and nothing else, so the OAuth and browser-session tables in the
+// same database stay out of an agent's reach.
+const readerRoleName = "tasks_reader"
+
+// readerRoleSQL provisions the reader role idempotently. The role is
+// cluster-wide while grants are per-database, and the task_overview grant must
+// be re-issued on every open because the view is dropped and recreated by
+// schemaSQL. Concurrent opens can race the CREATE ROLE, which the exception
+// handler absorbs.
+const readerRoleSQL = `
+DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'tasks_reader') THEN
+		CREATE ROLE tasks_reader NOLOGIN;
+	END IF;
+EXCEPTION
+	WHEN duplicate_object OR unique_violation THEN NULL;
+END
+$$;
+GRANT SELECT ON tasks, dependencies, images, task_revisions, task_overview TO tasks_reader;
+DO $$
+BEGIN
+	IF NOT pg_has_role(current_user, 'tasks_reader', 'MEMBER') THEN
+		EXECUTE format('GRANT tasks_reader TO %I', current_user);
+	END IF;
+END
+$$;
+`
+
 // Open connects to PostgreSQL, ensures the task schema exists, and returns a
 // ready Store. Callers must Close it.
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
@@ -240,7 +280,21 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("backfill task revisions: %w", err)
 	}
+	// Restricting agent SQL needs role privileges the connecting user may not
+	// have. Fall back to the user's own privileges rather than failing to
+	// start; ReaderRoleError lets the caller surface the gap.
+	if _, err := pool.Exec(ctx, readerRoleSQL); err != nil {
+		store.readerRoleErr = err
+	} else {
+		store.readerRole = readerRoleName
+	}
 	return store, nil
+}
+
+// ReaderRoleError reports why agent SQL queries are not restricted to the task
+// relations. It is nil when the restricted reader role is active.
+func (s *Store) ReaderRoleError() error {
+	return s.readerRoleErr
 }
 
 // Close releases the connection pool.
@@ -482,9 +536,14 @@ func (s *Store) Query(ctx context.Context, statement string) (Result, error) {
 	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = 5000"); err != nil {
 		return Result{}, err
 	}
+	if s.readerRole != "" {
+		if _, err := tx.Exec(ctx, "SET LOCAL ROLE "+s.readerRole); err != nil {
+			return Result{}, err
+		}
+	}
 	rows, err := tx.Query(ctx, statement)
 	if err != nil {
-		return Result{}, fmt.Errorf("execute read-only SQL: %w", err)
+		return Result{}, annotateQueryError(fmt.Errorf("execute read-only SQL: %w", err))
 	}
 	defer rows.Close()
 	descriptions := rows.FieldDescriptions()
@@ -509,9 +568,31 @@ func (s *Store) Query(ctx context.Context, statement string) (Result, error) {
 		result.Rows = append(result.Rows, row)
 	}
 	if err := rows.Err(); err != nil {
-		return Result{}, err
+		return Result{}, annotateQueryError(err)
 	}
 	return result, nil
+}
+
+// annotateQueryError points an undefined column or table error back at the
+// real schema, so a wrong guess is fixable in one step instead of a
+// discovery round-trip. Production transcripts show agents guessing columns
+// like task_overview.deleted_at and task_revisions.revision, then burning
+// calls on information_schema before retrying.
+func annotateQueryError(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	switch pgErr.Code {
+	case "42703", "42P01": // undefined column, undefined table
+		return fmt.Errorf("%w. Hint: names must match the stored schema exactly; list it with"+
+			" SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'."+
+			" task_overview lists live tasks only (deleted tasks are in tasks WHERE deleted_at IS NOT NULL)"+
+			" and carries dependency IDs in depends_on;"+
+			" task_revisions columns are revision_id, task_id, version, action, actor_kind, actor_id,"+
+			" source, request_id, occurred_at, before_state, after_state, metadata", err)
+	}
+	return err
 }
 
 func (s *Store) withTx(ctx context.Context, fn func(pgx.Tx) error) error {

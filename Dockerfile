@@ -1,5 +1,8 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.26-alpine AS build
+# git lets go build embed the VCS revision, which the binary reports as its
+# version when no release version was linked in.
+RUN apk add --no-cache git
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

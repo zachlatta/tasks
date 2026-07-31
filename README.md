@@ -161,15 +161,15 @@ WHERE table_schema = 'public'
 ORDER BY table_name, ordinal_position;
 ```
 
-Each read runs inside a PostgreSQL `READ ONLY` transaction; the HTTP API and MCP layers also reject statements that do not begin with `SELECT`, `WITH`, or `EXPLAIN`. The intentionally small schema is:
+Each read runs inside a PostgreSQL `READ ONLY` transaction as a dedicated `tasks_reader` role that can see only the task relations, so the OAuth and browser-session tables sharing the database stay out of an agent's reach; the HTTP API and MCP layers also reject statements that do not begin with `SELECT`, `WITH`, or `EXPLAIN`. (When the connecting database user lacks the privileges to provision that role, the server logs a warning at startup and reads fall back to the user's own privileges.) The intentionally small schema is:
 
 - `tasks(id, title, description, agent_session_url, status, position, wake_at, waiting_on, on_timeout, snooze_count, context, context_checked_at, created_at, updated_at, version, deleted_at)`, where `agent_session_url` is an optional exact Cmux workspace deep link, status is `todo`, `in_progress`, or `done`, `position` orders a column top to bottom, `context` is a tag rather than precise location data, and a non-null `deleted_at` marks a soft-deleted task
 - `dependencies(task_id, depends_on_id)`
 - `images(task_id, object_key, name, content_type)`
 - `task_revisions(revision_id, task_id, version, action, actor_kind, actor_id, source, request_id, occurred_at, before_state, after_state, metadata)`
-- `task_overview`: task columns plus `blocked`, `dependency_count`, and `image_count`, for live tasks only
+- `task_overview`: task columns plus `blocked`, `depends_on` (the prerequisite IDs as a text array), `dependency_count`, and `image_count`, for live tasks only
 
-`blocked` is `1` when at least one dependency is not done and `0` otherwise. Deleted tasks are absent from `task_overview`; read them from `tasks` with `deleted_at IS NOT NULL`. Agents can discover the schema directly through `information_schema`; there are no non-SQL read tools.
+`blocked` is `1` when at least one dependency is not done and `0` otherwise. Deleted tasks are absent from `task_overview`; read them from `tasks` with `deleted_at IS NOT NULL`. The `query_tasks_sql` tool description carries this complete schema, and a Postgres-backed test keeps the two from drifting apart; agents can also discover it directly through `information_schema`. There are no non-SQL read tools.
 
 ## Revision history
 
@@ -212,6 +212,10 @@ The process reads `.env` when it starts. Existing environment variables take pre
 | `TASKS_S3_USE_SSL` | `true` | Use TLS for object storage |
 
 The S3 credentials belong in deployment secrets, never in a committed `.env` file.
+
+## Operations
+
+The server writes one structured log line per request — method, path, status, and duration, never the query string or any body — so production errors are visible without exposing task content. Successful `/healthz` probes are not logged. `tasks version` (and the startup line) reports the release version when one was linked in, and otherwise the VCS revision Go embedded at build time, so a container built straight from a checkout still identifies its commit.
 
 ## Development
 
