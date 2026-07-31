@@ -7,7 +7,14 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /out/tasks ./cmd/tasks
+# Deployment platforms pass the commit being deployed as a build argument
+# (Coolify uses SOURCE_COMMIT). Link it in when present; otherwise the binary
+# falls back to the VCS revision go embeds from the .git directory.
+ARG SOURCE_COMMIT=""
+ARG GIT_COMMIT=""
+ARG COMMIT_SHA=""
+RUN commit="${SOURCE_COMMIT:-${GIT_COMMIT:-${COMMIT_SHA:-}}}" \
+	&& CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${commit:-dev}" -o /out/tasks ./cmd/tasks
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates wget && adduser -D -u 10001 app

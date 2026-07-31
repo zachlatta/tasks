@@ -41,8 +41,12 @@ func main() {
 // resolveVersion prefers the release version the linker injected and
 // otherwise falls back to the VCS revision Go embedded at build time, so a
 // production container built straight from a checkout still knows what it is
-// running.
+// running. A linked full commit SHA (deployment platforms pass one as a build
+// argument) is shortened for readability.
 func resolveVersion(linked string, info *debug.BuildInfo, ok bool) string {
+	if isFullCommitSHA(linked) {
+		return linked[:12]
+	}
 	if linked != "dev" || !ok || info == nil {
 		return linked
 	}
@@ -65,6 +69,23 @@ func resolveVersion(linked string, info *debug.BuildInfo, ok bool) string {
 		revision += "-dirty"
 	}
 	return revision
+}
+
+// isFullCommitSHA reports whether value is a bare 40-character hexadecimal
+// Git commit hash.
+func isFullCommitSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		switch {
+		case character >= '0' && character <= '9':
+		case character >= 'a' && character <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {

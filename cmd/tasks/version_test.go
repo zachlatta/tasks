@@ -30,6 +30,20 @@ func TestResolveVersion(t *testing.T) {
 			want:   "v1.2.3",
 		},
 		{
+			name:   "a full linked commit SHA is shortened",
+			linked: "0123456789abcdef0123456789abcdef01234567",
+			info:   nil,
+			ok:     false,
+			want:   "0123456789ab",
+		},
+		{
+			name:   "a release tag that is not a bare SHA stays whole",
+			linked: "v1.2.3-rc.1",
+			info:   nil,
+			ok:     false,
+			want:   "v1.2.3-rc.1",
+		},
+		{
 			name:   "dev falls back to the short revision",
 			linked: "dev",
 			info: buildInfo(
