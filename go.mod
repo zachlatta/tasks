@@ -7,7 +7,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/minio/minio-go/v7 v7.2.1
 	github.com/modelcontextprotocol/go-sdk v1.6.1
-	github.com/yuin/goldmark v1.8.4
+	github.com/yuin/goldmark v1.8.6
 )
 
 require (
