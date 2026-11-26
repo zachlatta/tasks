@@ -17,7 +17,7 @@ RUN commit="${SOURCE_COMMIT:-${GIT_COMMIT:-${COMMIT_SHA:-}}}" \
 	&& CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${commit:-dev}" -o /out/tasks ./cmd/tasks
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates wget && adduser -D -u 10001 app
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates wget && adduser -D -u 10001 app
 COPY --from=build /out/tasks /usr/local/bin/tasks
 # Only used for local file uploads; tasks live in PostgreSQL. Mount a volume
 # here (or use S3) when TASKS_OBJECT_STORE=local.
